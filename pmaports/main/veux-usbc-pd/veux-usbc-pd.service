@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Load HUSB311 USB-C PD support
+After=systemd-modules-load.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/veux-usbc-pd-start
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

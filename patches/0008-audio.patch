@@ -1,0 +1,299 @@
+Subject: [PATCH 08/11] WCD937x, SoundWire and Q6AFE audio fixes
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+index 1536fcd96..fd1c151b5 100644
+--- a/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
++++ b/Documentation/devicetree/bindings/sound/qcom,sm8250.yaml
+@@ -54,6 +54,7 @@ properties:
+           - qcom,sm8250-sndcard
+           - qcom,sm8450-sndcard
+           - qcom,x1e80100-sndcard
++          - xiaomi,veux-sndcard
+ 
+   audio-routing:
+     $ref: /schemas/types.yaml#/definitions/non-unique-string-array
+diff --git a/sound/soc/codecs/lpass-va-macro.c b/sound/soc/codecs/lpass-va-macro.c
+index dbc5795b9..68ff988ba 100644
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -1485,22 +1485,33 @@ static int va_macro_validate_dmic_sample_rate(u32 dmic_sample_rate,
+ static int va_macro_set_lpass_codec_version(struct va_macro *va)
+ {
+ 	int version = LPASS_CODEC_VERSION_UNKNOWN;
+-	u32 maj, min, step;
++	int ret;
++	u32 maj, min, step, features;
+ 	u32 val;
+ 
+-	regmap_read(va->regmap, CDC_VA_TOP_CSR_CORE_ID_0, &val);
++	ret = regmap_read(va->regmap, CDC_VA_TOP_CSR_CORE_ID_0, &val);
++	if (ret)
++		return ret;
+ 	maj = FIELD_GET(CORE_ID_0_REV_MAJ, val);
+ 
+-	regmap_read(va->regmap, CDC_VA_TOP_CSR_CORE_ID_1, &val);
++	ret = regmap_read(va->regmap, CDC_VA_TOP_CSR_CORE_ID_1, &val);
++	if (ret)
++		return ret;
++	features = val & 0xf;
+ 	if (!FIELD_GET(CORE_ID_1_HAS_VAMACRO, val)) {
+ 		dev_err(va->dev, "This is not a VA macro instance\n");
+ 		return -ENODEV;
+ 	}
+ 
+-	regmap_read(va->regmap, CDC_VA_TOP_CSR_CORE_ID_2, &val);
++	ret = regmap_read(va->regmap, CDC_VA_TOP_CSR_CORE_ID_2, &val);
++	if (ret)
++		return ret;
+ 	min = FIELD_GET(CORE_ID_2_REV_MIN, val);
+ 	step = FIELD_GET(CORE_ID_2_REV_STEP, val);
+ 
++	dev_info(va->dev, "VA revision %u.%u.%u, macro features %#x\n",
++		 maj, min, step, features);
++
+ 	if (maj == 1) {
+ 		version = LPASS_CODEC_VERSION_2_0;
+ 	} else if (maj == 2) {
+@@ -1508,6 +1519,11 @@ static int va_macro_set_lpass_codec_version(struct va_macro *va)
+ 		case 0:
+ 			version = LPASS_CODEC_VERSION_2_0;
+ 			break;
++		case 2:
++			/* Holi 2.2.0 is the RX/TX/VA-only Bolero 2.1 layout. */
++			if (features == 0xe && step == 0)
++				version = LPASS_CODEC_VERSION_2_1;
++			break;
+ 		case 5:
+ 			version = LPASS_CODEC_VERSION_2_5;
+ 			break;
+diff --git a/sound/soc/codecs/wcd937x-sdw.c b/sound/soc/codecs/wcd937x-sdw.c
+index 1ad75c226..35b3fe5ac 100644
+--- a/sound/soc/codecs/wcd937x-sdw.c
++++ b/sound/soc/codecs/wcd937x-sdw.c
+@@ -1003,6 +1003,8 @@ static int wcd9370_probe(struct sdw_slave *pdev,
+ 	if (wcd->is_tx) {
+ 		master_ch_mask_size = of_property_count_u8_elems(dev->of_node,
+ 								 "qcom,tx-channel-mapping");
++		master_ch_mask_size = clamp_t(int, master_ch_mask_size, 0,
++					     ARRAY_SIZE(wcd937x_sdw_tx_ch_info));
+ 
+ 		if (master_ch_mask_size)
+ 			ret = of_property_read_u8_array(dev->of_node, "qcom,tx-channel-mapping",
+@@ -1010,14 +1012,18 @@ static int wcd9370_probe(struct sdw_slave *pdev,
+ 	} else {
+ 		master_ch_mask_size = of_property_count_u8_elems(dev->of_node,
+ 								 "qcom,rx-channel-mapping");
++		master_ch_mask_size = clamp_t(int, master_ch_mask_size, 0,
++					     ARRAY_SIZE(wcd937x_sdw_rx_ch_info));
+ 
+ 		if (master_ch_mask_size)
+ 			ret = of_property_read_u8_array(dev->of_node, "qcom,rx-channel-mapping",
+ 							master_ch_mask, master_ch_mask_size);
+ 	}
+ 
+-	if (ret < 0)
++	if (ret < 0) {
+ 		dev_info(dev, "Static channel mapping not specified using device channel maps\n");
++		master_ch_mask_size = 0;
++	}
+ 
+ 	if (wcd->is_tx) {
+ 		pdev->prop.source_ports = GENMASK(WCD937X_MAX_TX_SWR_PORTS, 0);
+diff --git a/sound/soc/codecs/wcd937x.c b/sound/soc/codecs/wcd937x.c
+index 0dd05604f..6ab8de977 100644
+--- a/sound/soc/codecs/wcd937x.c
++++ b/sound/soc/codecs/wcd937x.c
+@@ -2476,16 +2476,37 @@ static const struct irq_domain_ops wcd_domain_ops = {
+ 	.map = wcd_irq_chip_map,
+ };
+ 
++static void wcd937x_irq_domain_remove(void *data)
++{
++	struct irq_domain *domain = data;
++
++	irq_dispose_mapping(irq_find_mapping(domain, 0));
++	irq_domain_remove(domain);
++}
++
+ static int wcd937x_irq_init(struct wcd937x_priv *wcd, struct device *dev)
+ {
++	unsigned int irq;
++	int ret;
++
+ 	wcd->virq = irq_domain_create_linear(NULL, 1, &wcd_domain_ops, NULL);
+ 	if (!(wcd->virq)) {
+ 		dev_err(dev, "%s: Failed to add IRQ domain\n", __func__);
+ 		return -EINVAL;
+ 	}
+ 
+-	return devm_regmap_add_irq_chip(dev, wcd->regmap,
+-					irq_create_mapping(wcd->virq, 0),
++	irq = irq_create_mapping(wcd->virq, 0);
++	if (!irq) {
++		irq_domain_remove(wcd->virq);
++		return -ENOMEM;
++	}
++
++	/* Release the regmap IRQ chip before its parent mapping and domain. */
++	ret = devm_add_action_or_reset(dev, wcd937x_irq_domain_remove, wcd->virq);
++	if (ret)
++		return ret;
++
++	return devm_regmap_add_irq_chip(dev, wcd->regmap, irq,
+ 					IRQF_ONESHOT, 0, &wcd937x_regmap_irq_chip,
+ 					&wcd->irq_chip);
+ }
+diff --git a/sound/soc/qcom/qdsp6/q6afe.c b/sound/soc/qcom/qdsp6/q6afe.c
+index f0ff1350e..299621945 100644
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -392,6 +392,7 @@ struct q6afe {
+ 	struct device *dev;
+ 	struct q6core_svc_api_info ainfo;
+ 	struct mutex lock;
++	u32 vote_handle;
+ 	struct aprv2_ibasic_rsp_result_t result;
+ 	wait_queue_head_t wait;
+ 	struct list_head port_list;
+@@ -664,6 +665,10 @@ struct afe_cmd_remote_lpass_core_hw_vote_request {
+ 	char client_name[8];
+ } __packed;
+ 
++struct afe_cmd_rsp_remote_lpass_core_hw_vote_request {
++	u32 client_handle;
++} __packed;
++
+ struct afe_cmd_remote_lpass_core_hw_devote_request {
+ 	uint32_t  hw_block_id;
+ 	uint32_t client_handle;
+@@ -1017,11 +1022,25 @@ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *da
+ 	res = data->payload;
+ 	switch (hdr->opcode) {
+ 	case APR_BASIC_RSP_RESULT: {
++		if (data->payload_size < sizeof(*res))
++			return -EINVAL;
+ 		if (res->status) {
+ 			dev_err(afe->dev, "cmd = 0x%x returned error = 0x%x\n",
+ 				res->opcode, res->status);
+ 		}
+ 		switch (res->opcode) {
++		case AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
++			/* Success has a separate response carrying the client handle. */
++			if (!res->status)
++				break;
++			afe->result.opcode = AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST;
++			afe->result.status = res->status;
++			wake_up(&afe->wait);
++			break;
++		case AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST:
++			afe->result = *res;
++			wake_up(&afe->wait);
++			break;
+ 		case AFE_PORT_CMD_SET_PARAM_V2:
+ 		case AFE_PORT_CMD_DEVICE_STOP:
+ 		case AFE_PORT_CMD_DEVICE_START:
+@@ -1042,11 +1061,17 @@ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *da
+ 		}
+ 	}
+ 		break;
+-	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
++	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST: {
++		const struct afe_cmd_rsp_remote_lpass_core_hw_vote_request *rsp = data->payload;
++
++		if (data->payload_size < sizeof(*rsp))
++			return -EINVAL;
++		afe->vote_handle = rsp->client_handle;
+ 		afe->result.opcode = hdr->opcode;
+-		afe->result.status = res->status;
++		afe->result.status = 0;
+ 		wake_up(&afe->wait);
+ 		break;
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -1070,14 +1095,17 @@ int q6afe_get_port_id(int index)
+ }
+ EXPORT_SYMBOL_GPL(q6afe_get_port_id);
+ 
+-static int afe_apr_send_pkt(struct q6afe *afe, struct apr_pkt *pkt,
+-			    struct q6afe_port *port, uint32_t rsp_opcode)
++static int afe_apr_send_pkt_with_handle(struct q6afe *afe, struct apr_pkt *pkt,
++				      struct q6afe_port *port, uint32_t rsp_opcode,
++				      u32 *client_handle)
+ {
+ 	wait_queue_head_t *wait;
+ 	struct aprv2_ibasic_rsp_result_t *result;
+ 	int ret;
+ 
+ 	mutex_lock(&afe->lock);
++	if (client_handle)
++		afe->vote_handle = 0;
+ 	if (port) {
+ 		wait = &port->wait;
+ 		result = &port->result;
+@@ -1109,11 +1137,23 @@ static int afe_apr_send_pkt(struct q6afe *afe, struct apr_pkt *pkt,
+ 	}
+ 
+ err:
++	if (!ret && client_handle) {
++		if (!afe->vote_handle)
++			ret = -EINVAL;
++		else
++			*client_handle = afe->vote_handle;
++	}
+ 	mutex_unlock(&afe->lock);
+ 
+ 	return ret;
+ }
+ 
++static int afe_apr_send_pkt(struct q6afe *afe, struct apr_pkt *pkt,
++			  struct q6afe_port *port, uint32_t rsp_opcode)
++{
++	return afe_apr_send_pkt_with_handle(afe, pkt, port, rsp_opcode, NULL);
++}
++
+ static int q6afe_set_param(struct q6afe *afe, struct q6afe_port *port,
+ 			   void *data, int param_id, int module_id, int psize,
+ 			   int token)
+@@ -1915,7 +1955,10 @@ int q6afe_unvote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
+ 	vote_cfg->hw_block_id = hw_block_id;
+ 	vote_cfg->client_handle = client_handle;
+ 
+-	ret = apr_send_pkt(afe->apr, pkt);
++	if (!client_handle)
++		return -EINVAL;
++	ret = afe_apr_send_pkt(afe, pkt, NULL,
++			       AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST);
+ 	if (ret < 0)
+ 		dev_err(afe->dev, "AFE failed to unvote (%d)\n", hw_block_id);
+ 
+@@ -1951,8 +1994,11 @@ int q6afe_vote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
+ 	strscpy(vote_cfg->client_name, client_name,
+ 			sizeof(vote_cfg->client_name));
+ 
+-	ret = afe_apr_send_pkt(afe, pkt, NULL,
+-			       AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST);
++	if (!client_handle)
++		return -EINVAL;
++	*client_handle = 0;
++	ret = afe_apr_send_pkt_with_handle(afe, pkt, NULL,
++			AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, client_handle);
+ 	if (ret)
+ 		dev_err(afe->dev, "AFE failed to vote (%d)\n", hw_block_id);
+ 
+diff --git a/sound/soc/qcom/sm8250.c b/sound/soc/qcom/sm8250.c
+index 76dc3a3f4..abc1fb60a 100644
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -205,6 +205,7 @@ static int sm8250_platform_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id snd_sm8250_dt_match[] = {
++	{ .compatible = "xiaomi,veux-sndcard", .data = "sm6375" },
+ 	{ .compatible = "fairphone,fp4-sndcard", .data = "sm7225" },
+ 	{ .compatible = "fairphone,fp5-sndcard", .data = "qcm6490" },
+ 	{ .compatible = "qcom,qrb2210-sndcard", .data = "qcm2290" },

@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Xiaomi veux WLAN firmware startup
+Wants=rmtfs.service tqftpserv.service
+After=rmtfs.service tqftpserv.service
+ConditionPathExists=/dev/qcom_rmtfs_mem1
+ConditionPathExists=/var/lib/rmtfs/modem_fs1
+ConditionPathExists=/var/lib/rmtfs/modem_fs2
+ConditionPathExists=/var/lib/rmtfs/modem_fsg
+ConditionPathExists=/lib/firmware/qcom/xiaomi/veux/modem_pr/so/544_0_d.mbn
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/veux-wifi-start
+TimeoutStartSec=150
+RemainAfterExit=yes

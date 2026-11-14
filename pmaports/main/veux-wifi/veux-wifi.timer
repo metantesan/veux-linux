@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Start Wi-Fi and modem initialization after boot without blocking the UI
+
+[Timer]
+OnBootSec=2s
+AccuracySec=1s
+Unit=veux-wifi.service
+
+[Install]
+WantedBy=mainline-bringup.target multi-user.target

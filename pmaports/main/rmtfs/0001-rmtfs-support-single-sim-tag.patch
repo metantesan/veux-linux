@@ -1,0 +1,196 @@
+diff --git a/qmi_rmtfs.c b/qmi_rmtfs.c
+index bda2b78..debf2de 100644
+--- a/qmi_rmtfs.c
++++ b/qmi_rmtfs.c
+@@ -235,6 +235,43 @@ struct qmi_elem_info rmtfs_dev_error_resp_ei[] = {
+ 	{}
+ };
+ 
++struct qmi_elem_info rmtfs_sim_tag_req_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(uint32_t),
++		.tlv_type = 1,
++		.offset = offsetof(struct rmtfs_sim_tag_req, caller_id),
++	},
++	{}
++};
++
++struct qmi_elem_info rmtfs_sim_tag_resp_ei[] = {
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct rmtfs_qmi_result),
++		.tlv_type = 2,
++		.offset = offsetof(struct rmtfs_sim_tag_resp, result),
++		.ei_array = rmtfs_qmi_result_ei,
++	},
++	{
++		.data_type = QMI_OPT_FLAG,
++		.elem_len = 1,
++		.elem_size = sizeof(bool),
++		.tlv_type = 16,
++		.offset = offsetof(struct rmtfs_sim_tag_resp, single_sim_tag_valid),
++	},
++	{
++		.data_type = QMI_UNSIGNED_1_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(uint8_t),
++		.tlv_type = 16,
++		.offset = offsetof(struct rmtfs_sim_tag_resp, single_sim_tag),
++	},
++	{}
++};
++
+ struct qmi_elem_info rmtfs_force_sync_ei[] = {
+ 	{
+ 		.data_type = QMI_DATA_LEN,
+diff --git a/qmi_rmtfs.h b/qmi_rmtfs.h
+index 03cbc8f..844dade 100644
+--- a/qmi_rmtfs.h
++++ b/qmi_rmtfs.h
+@@ -11,12 +11,14 @@
+ #define QMI_RMTFS_ERR_NONE 0
+ #define QMI_RMTFS_ERR_INTERNAL 1
+ #define QMI_RMTFS_ERR_MALFORMED_MSG 2
++#define QMI_RMTFS_ERR_INVALID_CLIENT 3
+ #define QMI_RMTFS_OPEN 1
+ #define QMI_RMTFS_CLOSE 2
+ #define QMI_RMTFS_RW_IOVEC 3
+ #define QMI_RMTFS_ALLOC_BUFF 4
+ #define QMI_RMTFS_GET_DEV_ERROR 5
+ #define QMI_RMTFS_FORCE_SYNC_IND 6
++#define QMI_RMTFS_GET_SINGLE_SIM_TAG 7
+ 
+ struct rmtfs_qmi_result {
+ 	uint16_t result;
+@@ -81,6 +83,16 @@ struct rmtfs_dev_error_resp {
+ 	uint8_t status;
+ };
+ 
++struct rmtfs_sim_tag_req {
++	uint32_t caller_id;
++};
++
++struct rmtfs_sim_tag_resp {
++	struct rmtfs_qmi_result result;
++	bool single_sim_tag_valid;
++	uint8_t single_sim_tag;
++};
++
+ struct rmtfs_force_sync {
+ 	size_t caller_id_len;
+ 	uint32_t caller_id[10];
+@@ -96,6 +108,8 @@ extern struct qmi_elem_info rmtfs_alloc_buf_req_ei[];
+ extern struct qmi_elem_info rmtfs_alloc_buf_resp_ei[];
+ extern struct qmi_elem_info rmtfs_dev_error_req_ei[];
+ extern struct qmi_elem_info rmtfs_dev_error_resp_ei[];
++extern struct qmi_elem_info rmtfs_sim_tag_req_ei[];
++extern struct qmi_elem_info rmtfs_sim_tag_resp_ei[];
+ extern struct qmi_elem_info rmtfs_force_sync_ei[];
+ 
+ #endif
+diff --git a/qmi_rmtfs.qmi b/qmi_rmtfs.qmi
+index ca350d7..5b1a9ea 100644
+--- a/qmi_rmtfs.qmi
++++ b/qmi_rmtfs.qmi
+@@ -13,6 +13,7 @@ const QMI_RMTFS_RW_IOVEC = 3;
+ const QMI_RMTFS_ALLOC_BUFF = 4;
+ const QMI_RMTFS_GET_DEV_ERROR = 5;
+ const QMI_RMTFS_FORCE_SYNC_IND = 6;
++const QMI_RMTFS_GET_SINGLE_SIM_TAG = 7;
+ 
+ struct qmi_result {
+ 	u16 result;
+@@ -75,3 +76,12 @@ response dev_error_resp {
+ indication force_sync {
+ 	required u32 caller_id(10) = 1;
+ } = 6;
++
++request sim_tag_req {
++	required u32 caller_id = 1;
++} = 7;
++
++response sim_tag_resp {
++	required qmi_result result = 2;
++	optional u8 single_sim_tag = 0x10;
++} = 7;
+diff --git a/rmtfs.c b/rmtfs.c
+index ec33a19..20bfae7 100644
+--- a/rmtfs.c
++++ b/rmtfs.c
+@@ -343,6 +343,59 @@ respond:
+ 			strerror(-ret));
+ }
+ 
++static void rmtfs_get_single_sim_tag(int sock, const struct qrtr_packet *pkt)
++{
++	struct rmtfs_sim_tag_resp resp = {};
++	struct rmtfs_sim_tag_req req = {};
++	DEFINE_QRTR_PACKET(resp_buf, 256);
++	struct rmtfd *rmtfd;
++	unsigned txn = 0;
++	ssize_t len;
++	int ret;
++
++	ret = qmi_decode_message(&req, &txn, pkt, QMI_REQUEST,
++				 QMI_RMTFS_GET_SINGLE_SIM_TAG,
++				 rmtfs_sim_tag_req_ei);
++	if (ret < 0) {
++		qmi_result_error(&resp.result, QMI_RMTFS_ERR_MALFORMED_MSG);
++		goto respond;
++	}
++
++	if (req.caller_id > INT_MAX) {
++		qmi_result_error(&resp.result, QMI_RMTFS_ERR_INVALID_CLIENT);
++		goto respond;
++	}
++	rmtfd = storage_get(pkt->node, (int)req.caller_id);
++	if (!rmtfd) {
++		/* Match rmt_storage's invalid-client response (QMI error 3). */
++		qmi_result_error(&resp.result, QMI_RMTFS_ERR_INVALID_CLIENT);
++		goto respond;
++	}
++
++	/* Stock veux rmt_storage defaults ro.miui.singlesim to "2". */
++	resp.single_sim_tag = 2;
++	resp.single_sim_tag_valid = true;
++
++respond:
++	dbgprintf("[RMTFS] single_sim_tag %u => %u (%u:%u)\n",
++		  req.caller_id, resp.single_sim_tag,
++		  resp.result.result, resp.result.error);
++	len = qmi_encode_message(&resp_buf, QMI_RESPONSE,
++				 QMI_RMTFS_GET_SINGLE_SIM_TAG, txn,
++				 &resp, rmtfs_sim_tag_resp_ei);
++	if (len < 0) {
++		fprintf(stderr, "[RMTFS] failed to encode single-sim-tag response: %s\n",
++			strerror(-len));
++		return;
++	}
++
++	ret = qrtr_sendto(sock, pkt->node, pkt->port,
++			  resp_buf.data, resp_buf.data_len);
++	if (ret < 0)
++		fprintf(stderr, "[RMTFS] failed to send single-sim-tag response: %s\n",
++			strerror(-ret));
++}
++
+ static int rmtfs_bye(uint32_t node)
+ {
+ 	dbgprintf("[RMTFS] bye from %d\n", node);
+@@ -409,8 +462,11 @@ static int handle_rmtfs(int sock)
+ 		case QMI_RMTFS_GET_DEV_ERROR:
+ 			rmtfs_get_dev_error(sock, &pkt);
+ 			break;
+-		default:
+-			fprintf(stderr, "[RMTFS] Unknown request: %d\n", msg_id);
++			case QMI_RMTFS_GET_SINGLE_SIM_TAG:
++				rmtfs_get_single_sim_tag(sock, &pkt);
++				break;
++			default:
++				fprintf(stderr, "[RMTFS] Unknown request: %d\n", msg_id);
+ 			break;
+ 		}
+ 

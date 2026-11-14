@@ -1,0 +1,15 @@
+/work/
+/out/
+/inputs/
+__pycache__/
+*.pyc
+*.img
+*.ko
+*.bin
+*.apk
+*.tar
+*.tar.gz
+*.tar.xz
+*.dtb
+*.orig
+*.rej

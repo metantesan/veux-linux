@@ -1,0 +1,390 @@
+Subject: [PATCH 07/11] MPSS, service domains and IPA cellular support
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/Documentation/devicetree/bindings/net/qcom,ipa.yaml b/Documentation/devicetree/bindings/net/qcom,ipa.yaml
+index 68ec76fe4..d0a181200 100644
+--- a/Documentation/devicetree/bindings/net/qcom,ipa.yaml
++++ b/Documentation/devicetree/bindings/net/qcom,ipa.yaml
+@@ -52,6 +52,7 @@ properties:
+           - qcom,sdx55-ipa
+           - qcom,sdx65-ipa
+           - qcom,sm6350-ipa
++          - qcom,sm6375-ipa
+           - qcom,sm8350-ipa
+           - qcom,sm8550-ipa
+       - items:
+diff --git a/drivers/net/ipa/ipa_main.c b/drivers/net/ipa/ipa_main.c
+index 14ac2d2fa..5fabccb87 100644
+--- a/drivers/net/ipa/ipa_main.c
++++ b/drivers/net/ipa/ipa_main.c
+@@ -664,6 +664,10 @@ static const struct of_device_id ipa_match[] = {
+ 		.compatible	= "qcom,sm8350-ipa",
+ 		.data		= &ipa_data_v4_9,
+ 	},
++	{
++		.compatible	= "qcom,sm6375-ipa",
++		.data		= &ipa_data_v4_11,
++	},
+ 	{
+ 		.compatible	= "qcom,sc7280-ipa",
+ 		.data		= &ipa_data_v4_11,
+@@ -793,6 +797,7 @@ static enum ipa_firmware_loader ipa_firmware_loader(struct device *dev)
+ static int ipa_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	const char *stage = "power/interconnect";
+ 	struct ipa_interrupt *interrupt;
+ 	enum ipa_firmware_loader loader;
+ 	const struct ipa_data *data;
+@@ -851,41 +856,50 @@ static int ipa_probe(struct platform_device *pdev)
+ 	ipa->modem_route_count = data->modem_route_count;
+ 	init_completion(&ipa->completion);
+ 
++	stage = "register mapping";
+ 	ret = ipa_reg_init(ipa, pdev);
+ 	if (ret)
+ 		goto err_kfree_ipa;
+ 
++	stage = "shared memory/IOMMU";
+ 	ret = ipa_mem_init(ipa, pdev, data->mem_data);
+ 	if (ret)
+ 		goto err_reg_exit;
+ 
++	stage = "command resources";
+ 	ret = ipa_cmd_init(ipa);
+ 	if (ret)
+ 		goto err_mem_exit;
+ 
++	stage = "GSI resources";
+ 	ret = gsi_init(&ipa->gsi, pdev, ipa->version, data->endpoint_count,
+ 		       data->endpoint_data);
+ 	if (ret)
+ 		goto err_mem_exit;
+ 
+ 	/* Result is a non-zero mask of endpoints that support filtering */
++	stage = "endpoint resources";
+ 	ret = ipa_endpoint_init(ipa, data->endpoint_count, data->endpoint_data);
+ 	if (ret)
+ 		goto err_gsi_exit;
+ 
++	stage = "routing tables";
+ 	ret = ipa_table_init(ipa);
+ 	if (ret)
+ 		goto err_endpoint_exit;
+ 
++	stage = "SMP2P handshake";
+ 	ret = ipa_smp2p_init(ipa, pdev, loader == IPA_LOADER_MODEM);
+ 	if (ret)
+ 		goto err_table_exit;
+ 
+ 	/* Power needs to be active for config and setup */
++	stage = "runtime power";
+ 	ret = pm_runtime_get_sync(dev);
+ 	if (WARN_ON(ret < 0))
+ 		goto err_power_put;
+ 
++	stage = "hardware configuration";
+ 	ret = ipa_config(ipa, data);
+ 	if (ret)
+ 		goto err_power_put;
+@@ -900,12 +914,14 @@ static int ipa_probe(struct platform_device *pdev)
+ 
+ 	if (loader == IPA_LOADER_SELF) {
+ 		/* The AP is loading GSI firmware; do so now */
++		stage = "firmware load/authentication";
+ 		ret = ipa_firmware_load(dev);
+ 		if (ret)
+ 			goto err_deconfig;
+ 	} /* Otherwise loader == IPA_LOADER_SKIP */
+ 
+ 	/* GSI firmware is loaded; proceed to setup */
++	stage = "GSI/endpoint setup";
+ 	ret = ipa_setup(ipa);
+ 	if (ret)
+ 		goto err_deconfig;
+@@ -936,7 +952,7 @@ static int ipa_probe(struct platform_device *pdev)
+ err_interrupt_exit:
+ 	ipa_interrupt_exit(interrupt);
+ 
+-	return ret;
++	return dev_err_probe(dev, ret, "%s initialization failed\n", stage);
+ }
+ 
+ static void ipa_remove(struct platform_device *pdev)
+diff --git a/drivers/net/ipa/ipa_qmi.c b/drivers/net/ipa/ipa_qmi.c
+index d771f3a71..9501d82fc 100644
+--- a/drivers/net/ipa/ipa_qmi.c
++++ b/drivers/net/ipa/ipa_qmi.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/qrtr.h>
++#include <linux/of.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
+ 
+@@ -76,6 +77,45 @@
+ 
+ #define QMI_INIT_DRIVER_TIMEOUT		60000	/* A minute in milliseconds */
+ 
++static bool ipa_qmi_holi(struct ipa *ipa)
++{
++	return of_device_is_compatible(ipa->dev->of_node, "qcom,sm6375-ipa");
++}
++
++/* The first host advertisement can precede a usable modem transport. Retry
++ * from the same server socket after the modem answers INIT_DRIVER.
++ */
++static int ipa_server_reannounce(struct ipa_qmi *ipa_qmi)
++{
++	struct qmi_handle *qmi = &ipa_qmi->server_handle;
++	struct sockaddr_qrtr local, dest;
++	struct qrtr_ctrl_pkt pkt = { };
++	struct msghdr msg = { };
++	struct kvec iv = { &pkt, sizeof(pkt) };
++	int ret;
++
++	mutex_lock(&qmi->sock_lock);
++	ret = kernel_getsockname(qmi->sock, (struct sockaddr *)&local);
++	if (ret < 0)
++		goto out;
++	dest = local;
++	dest.sq_port = QRTR_PORT_CTRL;
++	pkt.cmd = cpu_to_le32(QRTR_TYPE_NEW_SERVER);
++	pkt.server.service = cpu_to_le32(IPA_HOST_SERVICE_SVC_ID);
++	pkt.server.instance = cpu_to_le32(IPA_HOST_SVC_VERS |
++					IPA_HOST_SERVICE_INS_ID << 8);
++	pkt.server.node = cpu_to_le32(local.sq_node);
++	pkt.server.port = cpu_to_le32(local.sq_port);
++	msg.msg_name = &dest;
++	msg.msg_namelen = sizeof(dest);
++	ret = kernel_sendmsg(qmi->sock, &msg, &iv, 1, sizeof(pkt));
++	if (ret >= 0)
++		ret = 0;
++out:
++	mutex_unlock(&qmi->sock_lock);
++	return ret;
++}
++
+ /* Send an INIT_COMPLETE indication message to the modem */
+ static void ipa_server_init_complete(struct ipa_qmi *ipa_qmi)
+ {
+@@ -85,17 +125,24 @@ static void ipa_server_init_complete(struct ipa_qmi *ipa_qmi)
+ 	struct ipa_init_complete_ind ind = { };
+ 	int ret;
+ 
++	if (ipa_qmi_holi(ipa))
++		sq = &ipa_qmi->indication_sq;
++
+ 	ind.status.result = QMI_RESULT_SUCCESS_V01;
+ 	ind.status.error = QMI_ERR_NONE_V01;
+ 
+ 	ret = qmi_send_indication(qmi, sq, IPA_QMI_INIT_COMPLETE,
+ 				   IPA_QMI_INIT_COMPLETE_IND_SZ,
+ 				   ipa_init_complete_ind_ei, &ind);
+-	if (ret)
++	if (ret) {
+ 		dev_err(ipa->dev,
+ 			"error %d sending init complete indication\n", ret);
+-	else
++	} else {
+ 		ipa_qmi->indication_sent = true;
++		if (ipa_qmi_holi(ipa))
++			dev_info(ipa->dev, "Holi IPA AP completion sent to %u:%u\n",
++				 sq->sq_node, sq->sq_port);
++	}
+ }
+ 
+ /* If requested (and not already sent) send the INIT_COMPLETE indication */
+@@ -121,11 +168,20 @@ static void ipa_qmi_indication(struct ipa_qmi *ipa_qmi)
+  */
+ static void ipa_qmi_ready(struct ipa_qmi *ipa_qmi)
+ {
+-	struct ipa *ipa;
++	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
++	bool uc_ready = ipa_qmi->uc_ready;
+ 	int ret;
+ 
++	/* Holi's AP-loaded microcontroller reports readiness through its IRQ.
++	 * Its modem can omit DRIVER_INIT_COMPLETE when that firmware is already
++	 * loaded. The downstream driver gates on the successful INIT_DRIVER
++	 * exchange and this hardware-ready event, not the optional QMI request.
++	 */
++	if (ipa_qmi_holi(ipa))
++		uc_ready |= READ_ONCE(ipa->uc_loaded);
++
+ 	/* We aren't ready until the modem and microcontroller are */
+-	if (!ipa_qmi->modem_ready || !ipa_qmi->uc_ready)
++	if (!ipa_qmi->modem_ready || !uc_ready)
+ 		return;
+ 
+ 	/* Send the indication message if it was requested */
+@@ -141,10 +197,11 @@ static void ipa_qmi_ready(struct ipa_qmi *ipa_qmi)
+ 	}
+ 
+ 	/* We're ready.  Start up normal operation */
+-	ipa = container_of(ipa_qmi, struct ipa, qmi);
+ 	ret = ipa_modem_start(ipa);
+ 	if (ret)
+ 		dev_err(ipa->dev, "error %d starting modem\n", ret);
++	else if (ipa_qmi_holi(ipa))
++		dev_info(ipa->dev, "Holi IPA QMI handshake complete\n");
+ }
+ 
+ /* All QMI clients from the modem node are gone (modem shut down or crashed). */
+@@ -156,6 +213,7 @@ static void ipa_server_bye(struct qmi_handle *qmi, unsigned int node)
+ 
+ 	/* The modem client and server go away at the same time */
+ 	memset(&ipa_qmi->modem_sq, 0, sizeof(ipa_qmi->modem_sq));
++	memset(&ipa_qmi->indication_sq, 0, sizeof(ipa_qmi->indication_sq));
+ 
+ 	/* initial_boot doesn't change when modem reboots */
+ 	/* uc_ready doesn't change when modem reboots */
+@@ -185,6 +243,11 @@ static void ipa_server_indication_register(struct qmi_handle *qmi,
+ 	ipa_qmi = container_of(qmi, struct ipa_qmi, server_handle);
+ 	ipa = container_of(ipa_qmi, struct ipa, qmi);
+ 
++	ipa_qmi->indication_sq = *sq;
++	if (ipa_qmi_holi(ipa))
++		dev_info(ipa->dev, "Holi IPA indication client %u:%u\n",
++			 sq->sq_node, sq->sq_port);
++
+ 	rsp.rsp.result = QMI_RESULT_SUCCESS_V01;
+ 	rsp.rsp.error = QMI_ERR_NONE_V01;
+ 
+@@ -222,6 +285,8 @@ static void ipa_server_driver_init_complete(struct qmi_handle *qmi,
+ 				ipa_driver_init_complete_rsp_ei, &rsp);
+ 	if (!ret) {
+ 		ipa_qmi->uc_ready = true;
++		if (ipa_qmi_holi(ipa))
++			dev_info(ipa->dev, "Holi IPA modem completion received\n");
+ 		ipa_qmi_ready(ipa_qmi);		/* We might be ready now */
+ 	} else {
+ 		dev_err(ipa->dev,
+@@ -253,7 +318,16 @@ static void ipa_client_init_driver(struct qmi_handle *qmi,
+ 				   struct sockaddr_qrtr *sq,
+ 				   struct qmi_txn *txn, const void *decoded)
+ {
++	const struct ipa_init_modem_driver_rsp *rsp = decoded;
++	struct ipa_qmi *ipa_qmi = container_of(qmi, struct ipa_qmi, client_handle);
++	struct ipa *ipa = container_of(ipa_qmi, struct ipa, qmi);
++
+ 	txn->result = 0;	/* IPA_QMI_INIT_DRIVER request was successful */
++	if (ipa_qmi_holi(ipa) && rsp->rsp.result != QMI_RESULT_SUCCESS_V01) {
++		dev_err(ipa->dev, "Holi IPA modem rejected parameters: result=%u error=%u\n",
++			rsp->rsp.result, rsp->rsp.error);
++		txn->result = -EREMOTEIO;
++	}
+ 	complete(&txn->completion);
+ }
+ 
+@@ -433,6 +507,12 @@ static void ipa_client_init_driver_work(struct work_struct *work)
+ 
+ 	if (!ret) {
+ 		ipa_qmi->modem_ready = true;
++		if (ipa_qmi_holi(ipa)) {
++			dev_info(dev, "Holi IPA modem parameters accepted\n");
++			ret = ipa_server_reannounce(ipa_qmi);
++			if (ret)
++				dev_err(dev, "Holi IPA service reannouncement failed: %d\n", ret);
++		}
+ 		ipa_qmi_ready(ipa_qmi);		/* We might be ready now */
+ 	} else {
+ 		/* If any error occurs we need to cancel the transaction */
+diff --git a/drivers/net/ipa/ipa_qmi.h b/drivers/net/ipa/ipa_qmi.h
+index fb15ea7f4..f40c14cc1 100644
+--- a/drivers/net/ipa/ipa_qmi.h
++++ b/drivers/net/ipa/ipa_qmi.h
+@@ -18,6 +18,7 @@ struct ipa;
+  * @client_handle:	Used to send an QMI requests to the modem
+  * @server_handle:	Used to handle QMI requests from the modem
+  * @modem_sq:		QMAP socket address for the modem QMI server
++ * @indication_sq:	Modem client endpoint requesting indications
+  * @init_driver_work:	Work structure used for INIT_DRIVER message handling
+  * @initial_boot:	True if first boot has not yet completed
+  * @uc_ready:		True once DRIVER_INIT_COMPLETE request received
+@@ -31,6 +32,7 @@ struct ipa_qmi {
+ 
+ 	/* Information used for the client handle */
+ 	struct sockaddr_qrtr modem_sq;
++	struct sockaddr_qrtr indication_sq;
+ 	struct work_struct init_driver_work;
+ 
+ 	/* Flags used in negotiating readiness */
+diff --git a/drivers/remoteproc/qcom_q6v5_pas.c b/drivers/remoteproc/qcom_q6v5_pas.c
+index a005546c2..fe6c6ba6b 100644
+--- a/drivers/remoteproc/qcom_q6v5_pas.c
++++ b/drivers/remoteproc/qcom_q6v5_pas.c
+@@ -1033,6 +1033,22 @@ static const struct qcom_pas_data sm6350_adsp_resource = {
+ 	.ssctl_id = 0x14,
+ };
+ 
++static const struct qcom_pas_data sm6375_adsp_resource = {
++	.crash_reason_smem = 423,
++	.firmware_name = "adsp.mdt",
++	.pas_id = 1,
++	.auto_boot = false, /* Start explicitly while bringing up audio. */
++	.proxy_pd_names = (char*[]){
++		"lcx",
++		"lmx",
++		NULL
++	},
++	.load_state = "adsp",
++	.ssr_name = "lpass",
++	.sysmon_name = "adsp",
++	.ssctl_id = 0x14,
++};
++
+ static const struct qcom_pas_data sm6375_mpss_resource = {
+ 	.crash_reason_smem = 421,
+ 	.firmware_name = "modem.mdt",
+@@ -1881,7 +1897,7 @@ static const struct of_device_id qcom_pas_of_match[] = {
+ 	{ .compatible = "qcom,sm6350-adsp-pas", .data = &sm6350_adsp_resource },
+ 	{ .compatible = "qcom,sm6350-cdsp-pas", .data = &sm6350_cdsp_resource },
+ 	{ .compatible = "qcom,sm6350-mpss-pas", .data = &mpss_resource_init },
+-	{ .compatible = "qcom,sm6375-adsp-pas", .data = &sm6350_adsp_resource },
++	{ .compatible = "qcom,sm6375-adsp-pas", .data = &sm6375_adsp_resource },
+ 	{ .compatible = "qcom,sm6375-cdsp-pas", .data = &sm8150_cdsp_resource },
+ 	{ .compatible = "qcom,sm6375-mpss-pas", .data = &sm6375_mpss_resource },
+ 	{ .compatible = "qcom,sm8150-adsp-pas", .data = &sm8150_adsp_resource },
+diff --git a/drivers/soc/qcom/qcom_pd_mapper.c b/drivers/soc/qcom/qcom_pd_mapper.c
+index 64ca99d7f..2fb2cb845 100644
+--- a/drivers/soc/qcom/qcom_pd_mapper.c
++++ b/drivers/soc/qcom/qcom_pd_mapper.c
+@@ -548,6 +548,17 @@ static const struct qcom_pdm_domain_data *sm6115_domains[] = {
+ 	NULL,
+ };
+ 
++/* SM6375 domain list from the stock service-registry firmware. */
++static const struct qcom_pdm_domain_data *sm6375_domains[] = {
++	&adsp_audio_pd,
++	&adsp_root_pd,
++	&adsp_sensor_pd,
++	&cdsp_root_pd,
++	&mpss_root_pd_gps_pdr,
++	&mpss_wlan_pd,
++	NULL,
++};
++
+ static const struct qcom_pdm_domain_data *sm6350_domains[] = {
+ 	&adsp_audio_pd,
+ 	&adsp_root_pd,
+@@ -620,6 +631,8 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
+ 	{ .compatible = "qcom,apq8064", .data = NULL, },
+ 	{ .compatible = "qcom,apq8074", .data = NULL, },
+ 	{ .compatible = "qcom,apq8084", .data = NULL, },
++	/* Xiaomi firmware exposes the downstream SM6375 name at the root. */
++	{ .compatible = "qcom,blair", .data = sm6375_domains, },
+ 	{ .compatible = "qcom,eliza", .data = sm8550_domains, },
+ 	{ .compatible = "qcom,apq8096", .data = msm8996_domains, },
+ 	{ .compatible = "qcom,glymur", .data = glymur_domains, },
+@@ -653,6 +666,7 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
+ 	{ .compatible = "qcom,sm4250", .data = sm6115_domains, },
+ 	{ .compatible = "qcom,sm6115", .data = sm6115_domains, },
+ 	{ .compatible = "qcom,sm6350", .data = sm6350_domains, },
++	{ .compatible = "qcom,sm6375", .data = sm6375_domains, },
+ 	{ .compatible = "qcom,sm7150", .data = sm7150_domains, },
+ 	{ .compatible = "qcom,sm7225", .data = sm6350_domains, },
+ 	{ .compatible = "qcom,sm7325", .data = sc7280_domains, },

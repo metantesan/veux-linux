@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-2.0-only
+# RAM-only OpenRC provider for the network already used by the NBD root.
+description="Keep mainline USB netboot networking configured"
+depend() {
+	provide net
+}
+start() {
+	local iface
+	iface=$(cat /sys/kernel/config/usb_gadget/veux_mainline/functions/ncm.usb0/ifname) || return 1
+	ip link set "$iface" up || return 1
+	ip address replace 172.16.42.1/24 dev "$iface"
+}
+stop() {
+	# Tearing this interface down would disconnect the root filesystem.
+	return 0
+}

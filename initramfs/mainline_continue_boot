@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+if [ ! -e /run/mainline-root-ready ]; then
+	echo 'Netboot root is not ready. Inspect /run/mainline-init.log.'
+	exit 1
+fi
+if [ -x /sysroot/usr/lib/systemd/systemd ]; then
+	echo 'Starting the NBD rootfs with the systemd diagnostic target.'
+elif [ -x /sysroot/sbin/openrc ] && [ -x /sysroot/etc/init.d/dropbear ]; then
+	echo 'Starting the NBD rootfs with the OpenRC diagnostic runlevel.'
+else
+	echo 'Expected a systemd or OpenRC rootfs; refusing to continue.'
+	exit 1
+fi
+touch /run/mainline-continue

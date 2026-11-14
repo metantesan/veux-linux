@@ -1,0 +1,91 @@
+Subject: [PATCH 01/11] ARM64 boot entry and restricted SM6375 pin control
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/Documentation/devicetree/bindings/pinctrl/qcom,sm6375-tlmm.yaml b/Documentation/devicetree/bindings/pinctrl/qcom,sm6375-tlmm.yaml
+index c11af09c3..ebb0c2c72 100644
+--- a/Documentation/devicetree/bindings/pinctrl/qcom,sm6375-tlmm.yaml
++++ b/Documentation/devicetree/bindings/pinctrl/qcom,sm6375-tlmm.yaml
+@@ -17,7 +17,11 @@ allOf:
+ 
+ properties:
+   compatible:
+-    const: qcom,sm6375-tlmm
++    oneOf:
++      - const: qcom,sm6375-tlmm
++      - items:
++          - const: xiaomi,veux-tlmm
++          - const: qcom,sm6375-tlmm
+ 
+   reg:
+     maxItems: 1
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 87a822e5c..db368fab4 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -60,7 +60,11 @@
+ 	 */
+ 	efi_signature_nop			// special NOP to identity as PE/COFF executable
+ 	b	primary_entry			// branch to kernel start, magic
+-	.quad	0				// Image load offset from start of RAM, little-endian
++	/* Qualcomm ABL compatibility: match the working veux Android Image.
++	 * See 20251006-arm64-text-offset-v1-1-bf0e8a27383b@oss.qualcomm.com.
++	 * This header field is not used for linking the upstream kernel.
++	 */
++	.quad	0x80000				// Image load offset from start of RAM, little-endian
+ 	le64sym	_kernel_size_le			// Effective size of kernel image, little-endian
+ 	le64sym	_kernel_flags_le		// Informative flags, little-endian
+ 	.quad	0				// reserved
+diff --git a/drivers/pinctrl/qcom/pinctrl-sm6375.c b/drivers/pinctrl/qcom/pinctrl-sm6375.c
+index 8da71d940..e506ab78e 100644
+--- a/drivers/pinctrl/qcom/pinctrl-sm6375.c
++++ b/drivers/pinctrl/qcom/pinctrl-sm6375.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/slab.h>
+ 
+ #include "pinctrl-msm.h"
+ 
+@@ -1499,10 +1500,38 @@ static const struct msm_pinctrl_soc_data sm6375_tlmm = {
+ 
+ static int sm6375_tlmm_probe(struct platform_device *pdev)
+ {
+-	return msm_pinctrl_probe(pdev, &sm6375_tlmm);
++	struct msm_pinctrl_soc_data *soc;
++	struct msm_pingroup *groups;
++	unsigned int i;
++
++	/* Keep the existing SM6375/Sony path unchanged during veux bring-up. */
++	if (!of_device_is_compatible(pdev->dev.of_node, "xiaomi,veux-tlmm"))
++		return msm_pinctrl_probe(pdev, &sm6375_tlmm);
++
++	soc = devm_kmemdup(&pdev->dev, &sm6375_tlmm,
++			   sizeof(sm6375_tlmm), GFP_KERNEL);
++	if (!soc)
++		return -ENOMEM;
++	groups = devm_kmemdup(&pdev->dev, sm6375_groups,
++			      sizeof(sm6375_groups), GFP_KERNEL);
++	if (!groups)
++		return -ENOMEM;
++
++	/* The captured veux map uses 0x400000 with these offsets, while
++	 * the mainline resource starts at 0x500000. Normal GPIOs already
++	 * account for that; dedicated UFS/SDC pads still need adjustment.
++	 */
++	for (i = 156; i < ARRAY_SIZE(sm6375_groups); i++) {
++		groups[i].ctl_reg -= 0x100000;
++		if (groups[i].io_reg)
++			groups[i].io_reg -= 0x100000;
++	}
++	soc->groups = groups;
++	return msm_pinctrl_probe(pdev, soc);
+ }
+ 
+ static const struct of_device_id sm6375_tlmm_of_match[] = {
++	{ .compatible = "xiaomi,veux-tlmm", },
+ 	{ .compatible = "qcom,sm6375-tlmm", },
+ 	{ },
+ };

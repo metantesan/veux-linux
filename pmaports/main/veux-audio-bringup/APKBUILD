@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-only
+maintainer="hikari <me@metantesan.com>"
+pkgname=veux-audio-bringup
+pkgver=1
+pkgrel=1
+pkgdesc="Xiaomi veux audio DSP, speaker playback, and PulseAudio UCM profile"
+url="https://postmarketos.org"
+arch="aarch64"
+# The external amplifier firmware is not covered by the source-script license.
+# Redistribution permission must be reviewed before publishing a generated APK.
+license="GPL-2.0-only AND proprietary"
+depends="systemd kmod alsa-utils alsa-ucm-conf"
+source="veux-audio-modules-7.3.0-veux-mainline.tar veux_swr_tx_reset.ko aw882xx_pid_2113_acf.bin Xiaomi-veux.conf HiFi.conf veux-audio-start veux-audio.service veux-audio.timer 60-veux-audio.preset"
+options="!check !archcheck"
+
+package() {
+	install -d "$pkgdir/usr/lib/veux-audio"
+	tar -xf "$srcdir/veux-audio-modules-7.3.0-veux-mainline.tar" -C "$pkgdir/usr/lib/veux-audio"
+	install -m644 "$srcdir/veux_swr_tx_reset.ko" "$pkgdir/usr/lib/veux-audio/"
+	install -Dm644 "$srcdir/aw882xx_pid_2113_acf.bin" "$pkgdir/usr/lib/firmware/qcom/xiaomi/veux/aw882xx_pid_2113_acf.bin"
+	install -Dm644 "$srcdir/Xiaomi-veux.conf" "$pkgdir/usr/share/alsa/ucm2/conf.d/sm6375/Xiaomi veux.conf"
+	install -Dm644 "$srcdir/HiFi.conf" "$pkgdir/usr/share/alsa/ucm2/veux/HiFi.conf"
+	install -Dm755 "$srcdir/veux-audio-start" "$pkgdir/usr/libexec/veux-audio-start"
+	install -Dm644 "$srcdir/veux-audio.service" "$pkgdir/usr/lib/systemd/system/veux-audio.service"
+	install -Dm644 "$srcdir/veux-audio.timer" "$pkgdir/usr/lib/systemd/system/veux-audio.timer"
+	install -Dm644 "$srcdir/60-veux-audio.preset" "$pkgdir/usr/lib/systemd/system-preset/60-veux-audio.preset"
+	for target in mainline-bringup multi-user; do
+		install -d "$pkgdir/etc/systemd/system/$target.target.wants"
+		ln -s /usr/lib/systemd/system/veux-audio.timer "$pkgdir/etc/systemd/system/$target.target.wants/veux-audio.timer"
+	done
+}
+
+# Filled in the staged copy by stage-rootfs-packages.py.
+sha512sums=""

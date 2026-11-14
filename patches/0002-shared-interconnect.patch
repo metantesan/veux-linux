@@ -1,0 +1,197 @@
+Subject: [PATCH 02/11] Shared display and IPA interconnect provider
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/drivers/interconnect/qcom/Kconfig b/drivers/interconnect/qcom/Kconfig
+index b3187acf9..bc572cf02 100644
+--- a/drivers/interconnect/qcom/Kconfig
++++ b/drivers/interconnect/qcom/Kconfig
+@@ -5,6 +5,15 @@ config INTERCONNECT_QCOM
+ 	help
+ 	  Support for Qualcomm's Network-on-Chip interconnect hardware.
+ 
++config INTERCONNECT_QCOM_HOLI_DISPLAY
++	tristate "Qualcomm SM6375 Holi display interconnect path"
++	depends on INTERCONNECT_QCOM && QCOM_SMD_RPM
++	select INTERCONNECT_QCOM_SMD_RPM
++	default ARCH_QCOM
++	help
++	  Minimal SM6375/Holi MDP-to-EBI bandwidth path used by the Xiaomi veux
++	  display controller during mainline bring-up.
++
+ config INTERCONNECT_QCOM_BCM_VOTER
+ 	tristate
+ 
+diff --git a/drivers/interconnect/qcom/Makefile b/drivers/interconnect/qcom/Makefile
+index 5f139a370..3b986986a 100644
+--- a/drivers/interconnect/qcom/Makefile
++++ b/drivers/interconnect/qcom/Makefile
+@@ -7,6 +7,7 @@ icc-bcm-voter-objs			:= bcm-voter.o
+ qnoc-eliza-objs				:= eliza.o
+ qnoc-glymur-objs			:= glymur.o
+ qnoc-hawi-objs				:= hawi.o
++qnoc-holi-display-objs			:= holi-display.o
+ qnoc-kaanapali-objs			:= kaanapali.o
+ qnoc-maili-objs				:= maili.o
+ qnoc-milos-objs				:= milos.o
+@@ -56,6 +57,7 @@ obj-$(CONFIG_INTERCONNECT_QCOM_BCM_VOTER) += icc-bcm-voter.o
+ obj-$(CONFIG_INTERCONNECT_QCOM_ELIZA) += qnoc-eliza.o
+ obj-$(CONFIG_INTERCONNECT_QCOM_GLYMUR) += qnoc-glymur.o
+ obj-$(CONFIG_INTERCONNECT_QCOM_HAWI) += qnoc-hawi.o
++obj-$(CONFIG_INTERCONNECT_QCOM_HOLI_DISPLAY) += qnoc-holi-display.o
+ obj-$(CONFIG_INTERCONNECT_QCOM_KAANAPALI) += qnoc-kaanapali.o
+ obj-$(CONFIG_INTERCONNECT_QCOM_MAILI) += qnoc-maili.o
+ obj-$(CONFIG_INTERCONNECT_QCOM_MILOS) += qnoc-milos.o
+diff --git a/drivers/interconnect/qcom/holi-display.c b/drivers/interconnect/qcom/holi-display.c
+new file mode 100644
+index 000000000..09e602ca6
+--- /dev/null
++++ b/drivers/interconnect/qcom/holi-display.c
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Minimal SM6375/Holi display-to-memory bandwidth path for veux bring-up.
++ * The route and EBI RPM ID are taken from the phone's captured Android FDT.
++ */
++
++#include <dt-bindings/interconnect/qcom,sm6375-veux.h>
++#include <dt-bindings/interconnect/qcom,sm6375-veux-ipa.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include "icc-rpm.h"
++
++static const u16 mdp_to_ebi_links[] = {
++	VEUX_SLAVE_EBI,
++};
++
++static struct qcom_icc_node ebi = {
++	.name = "ebi",
++	.id = VEUX_SLAVE_EBI,
++	.channels = 2,
++	.buswidth = 4,
++	.mas_rpm_id = -1,
++	.slv_rpm_id = 0, /* ICBID_SLAVE_EBI1 in the downstream Holi RPM map. */
++};
++
++static struct qcom_icc_node mdp = {
++	.name = "mdp0",
++	.id = VEUX_MASTER_MDP0,
++	.channels = 1,
++	.buswidth = 32,
++	.mas_rpm_id = -1, /* The downstream MASTER_MDP_PORT0 has no RPM ID. */
++	.slv_rpm_id = -1,
++	.num_links = ARRAY_SIZE(mdp_to_ebi_links),
++	.links = mdp_to_ebi_links,
++};
++
++/* IPA and display share EBI so RPM memory votes must be aggregated. */
++static const u16 ipa_links[] = { VEUX_SLAVE_EBI, VEUX_IPA_OCIMEM };
++static const u16 apps_links[] = { VEUX_IPA_CFG };
++
++static struct qcom_icc_node ipa_master = {
++	.name = "ipa",
++	.id = VEUX_IPA_MASTER,
++	.channels = 1,
++	.buswidth = 8,
++	.mas_rpm_id = 59,
++	.slv_rpm_id = -1,
++	.num_links = ARRAY_SIZE(ipa_links),
++	.links = ipa_links,
++};
++
++static struct qcom_icc_node ipa_ocimem = {
++	.name = "ipa-ocimem",
++	.id = VEUX_IPA_OCIMEM,
++	.channels = 1,
++	.buswidth = 4,
++	.mas_rpm_id = -1,
++	.slv_rpm_id = 26,
++};
++
++static struct qcom_icc_node ipa_apps = {
++	.name = "ipa-apps",
++	.id = VEUX_IPA_APPS,
++	.channels = 1,
++	.buswidth = 16,
++	.mas_rpm_id = -1,
++	.slv_rpm_id = -1,
++	.num_links = ARRAY_SIZE(apps_links),
++	.links = apps_links,
++};
++
++static struct qcom_icc_node ipa_cfg = {
++	.name = "ipa-config",
++	.id = VEUX_IPA_CFG,
++	.channels = 1,
++	.buswidth = 4,
++	.mas_rpm_id = -1,
++	.slv_rpm_id = -1,
++};
++
++/* qnoc_probe stores nodes by array index and requires onecell IDs to match. */
++static struct qcom_icc_node *holi_display_nodes[] = {
++	&ebi,
++	&mdp,
++	&ipa_master,
++	&ipa_ocimem,
++	&ipa_apps,
++	&ipa_cfg,
++};
++
++static const struct qcom_icc_desc holi_display = {
++	.nodes = holi_display_nodes,
++	.num_nodes = ARRAY_SIZE(holi_display_nodes),
++};
++
++static const struct of_device_id holi_display_of_match[] = {
++	{ .compatible = "qcom,sm6375-holi-display-icc", .data = &holi_display },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, holi_display_of_match);
++
++static struct platform_driver holi_display_driver = {
++	.probe = qnoc_probe,
++	.remove = qnoc_remove,
++	.driver = {
++		.name = "qnoc-sm6375-holi-display",
++		.of_match_table = holi_display_of_match,
++	},
++};
++module_platform_driver(holi_display_driver);
++
++MODULE_DESCRIPTION("SM6375 Holi display-to-memory ICC path");
++MODULE_LICENSE("GPL");
+diff --git a/include/dt-bindings/interconnect/qcom,sm6375-veux-ipa.h b/include/dt-bindings/interconnect/qcom,sm6375-veux-ipa.h
+new file mode 100644
+index 000000000..ae3eee040
+--- /dev/null
++++ b/include/dt-bindings/interconnect/qcom,sm6375-veux-ipa.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __DT_BINDINGS_INTERCONNECT_QCOM_SM6375_VEUX_IPA_H
++#define __DT_BINDINGS_INTERCONNECT_QCOM_SM6375_VEUX_IPA_H
++
++/* Additional shared-provider IDs; EBI=0 and MDP=1 stay unchanged. */
++#define VEUX_IPA_MASTER	2
++#define VEUX_IPA_OCIMEM	3
++#define VEUX_IPA_APPS	4
++#define VEUX_IPA_CFG	5
++
++#endif
+diff --git a/include/dt-bindings/interconnect/qcom,sm6375-veux.h b/include/dt-bindings/interconnect/qcom,sm6375-veux.h
+new file mode 100644
+index 000000000..7c60aed07
+--- /dev/null
++++ b/include/dt-bindings/interconnect/qcom,sm6375-veux.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef __DT_BINDINGS_INTERCONNECT_QCOM_SM6375_VEUX_H
++#define __DT_BINDINGS_INTERCONNECT_QCOM_SM6375_VEUX_H
++
++/* Compact provider-local IDs; distinct from downstream Holi graph IDs. */
++#define VEUX_SLAVE_EBI		0
++#define VEUX_MASTER_MDP0	1
++
++#endif

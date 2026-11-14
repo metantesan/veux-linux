@@ -1,0 +1,968 @@
+Subject: [PATCH 10/11] Experimental CAMSS, CCI and S5KHM2 identity probe
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/Documentation/devicetree/bindings/i2c/qcom,i2c-cci.yaml b/Documentation/devicetree/bindings/i2c/qcom,i2c-cci.yaml
+index 1e8def25e..62878dc10 100644
+--- a/Documentation/devicetree/bindings/i2c/qcom,i2c-cci.yaml
++++ b/Documentation/devicetree/bindings/i2c/qcom,i2c-cci.yaml
+@@ -39,6 +39,7 @@ properties:
+               - qcom,shikra-cci
+               - qcom,sm6150-cci
+               - qcom,sm6350-cci
++              - qcom,sm6375-cci
+               - qcom,sm8250-cci
+               - qcom,sm8450-cci
+               - qcom,sm8550-cci
+@@ -141,6 +142,7 @@ allOf:
+               - qcom,qcm2290-cci
+               - qcom,qcs8300-cci
+               - qcom,shikra-cci
++              - qcom,sm6375-cci
+               - qcom,sm8750-cci
+     then:
+       properties:
+diff --git a/drivers/i2c/busses/i2c-qcom-cci.c b/drivers/i2c/busses/i2c-qcom-cci.c
+index bd70c6bae..a78110c74 100644
+--- a/drivers/i2c/busses/i2c-qcom-cci.c
++++ b/drivers/i2c/busses/i2c-qcom-cci.c
+@@ -4,13 +4,18 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/io.h>
+ #include <linux/interrupt.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/pm_runtime.h>
++#include <linux/workqueue.h>
+ 
+ #define CCI_HW_VERSION				0x0
+ #define CCI_RESET_CMD				0x004
+@@ -37,6 +42,18 @@
+ #define CCI_I2C_Mm_Qn_LOAD_DATA(m, n)		(0x310 + 0x200 * (m) + 0x100 * (n))
+ 
+ #define CCI_IRQ_GLOBAL_CLEAR_CMD		0xc00
++#define TLMM_GPIO39_CTL_REG			0x27000
++#define TLMM_GPIO39_IO_REG			0x27004
++#define TLMM_GPIO40_CTL_REG			0x28000
++#define TLMM_GPIO40_IO_REG			0x28004
++#define TLMM_GPIO34_CTL_REG			0x22000
++#define TLMM_GPIO34_IO_REG			0x22004
++#define TLMM_GPIO43_CTL_REG			0x2b000
++#define TLMM_GPIO43_IO_REG			0x2b004
++#define TLMM_GPIO58_CTL_REG			0x3a000
++#define TLMM_GPIO58_IO_REG			0x3a004
++#define TLMM_GPIO93_CTL_REG			0x5d000
++#define TLMM_GPIO93_IO_REG			0x5d004
+ #define CCI_IRQ_MASK_0				0xc04
+ #define CCI_IRQ_MASK_0_I2C_M0_RD_DONE		BIT(0)
+ #define CCI_IRQ_MASK_0_I2C_M0_Q0_REPORT		BIT(4)
+@@ -123,10 +140,18 @@ struct cci_data {
+ struct cci {
+ 	struct device *dev;
+ 	void __iomem *base;
++	void __iomem *tlmm_base;
+ 	unsigned int irq;
+ 	const struct cci_data *data;
+ 	struct clk_bulk_data *clocks;
+ 	int nclocks;
++	struct mutex init_lock;
++	bool needs_first_xfer_init;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_default;
++	struct pinctrl_state *pins_gpio_probe;
++	struct pinctrl_state *pins_gpio_high;
++	struct delayed_work gpio_idle_sample_work;
+ 	struct cci_master master[NUM_MASTERS];
+ };
+ 
+@@ -134,6 +159,7 @@ static irqreturn_t cci_isr(int irq, void *dev)
+ {
+ 	struct cci *cci = dev;
+ 	u32 val, reset = 0;
++	bool complete_m0 = false, complete_m1 = false;
+ 	int ret = IRQ_NONE;
+ 
+ 	val = readl(cci->base + CCI_IRQ_STATUS_0);
+@@ -151,7 +177,7 @@ static irqreturn_t cci_isr(int irq, void *dev)
+ 			val & CCI_IRQ_STATUS_0_I2C_M0_Q0_REPORT ||
+ 			val & CCI_IRQ_STATUS_0_I2C_M0_Q1_REPORT) {
+ 		cci->master[0].status = 0;
+-		complete(&cci->master[0].irq_complete);
++		complete_m0 = true;
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+@@ -159,17 +185,19 @@ static irqreturn_t cci_isr(int irq, void *dev)
+ 			val & CCI_IRQ_STATUS_0_I2C_M1_Q0_REPORT ||
+ 			val & CCI_IRQ_STATUS_0_I2C_M1_Q1_REPORT) {
+ 		cci->master[1].status = 0;
+-		complete(&cci->master[1].irq_complete);
++		complete_m1 = true;
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+ 	if (unlikely(val & CCI_IRQ_STATUS_0_I2C_M0_Q0Q1_HALT_ACK)) {
+ 		reset |= CCI_RESET_CMD_M0_MASK;
++		complete_m0 = true;
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+ 	if (unlikely(val & CCI_IRQ_STATUS_0_I2C_M1_Q0Q1_HALT_ACK)) {
+ 		reset |= CCI_RESET_CMD_M1_MASK;
++		complete_m1 = true;
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+@@ -177,6 +205,7 @@ static irqreturn_t cci_isr(int irq, void *dev)
+ 		writel(reset, cci->base + CCI_RESET_CMD);
+ 
+ 	if (unlikely(val & CCI_IRQ_STATUS_0_I2C_M0_ERROR)) {
++		dev_err(cci->dev, "master 0 queue error IRQ %#x\n", val);
+ 		if (val & CCI_IRQ_STATUS_0_I2C_M0_Q0_NACK_ERR ||
+ 			val & CCI_IRQ_STATUS_0_I2C_M0_Q1_NACK_ERR)
+ 			cci->master[0].status = -ENXIO;
+@@ -188,6 +217,7 @@ static irqreturn_t cci_isr(int irq, void *dev)
+ 	}
+ 
+ 	if (unlikely(val & CCI_IRQ_STATUS_0_I2C_M1_ERROR)) {
++		dev_err(cci->dev, "master 1 queue error IRQ %#x\n", val);
+ 		if (val & CCI_IRQ_STATUS_0_I2C_M1_Q0_NACK_ERR ||
+ 			val & CCI_IRQ_STATUS_0_I2C_M1_Q1_NACK_ERR)
+ 			cci->master[1].status = -ENXIO;
+@@ -198,6 +228,12 @@ static irqreturn_t cci_isr(int irq, void *dev)
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
++	/* Wake a failed transfer only after the controller has halted its queue. */
++	if (complete_m0)
++		complete(&cci->master[0].irq_complete);
++	if (complete_m1)
++		complete(&cci->master[1].irq_complete);
++
+ 	return ret;
+ }
+ 
+@@ -276,6 +312,8 @@ static int cci_reset(struct cci *cci)
+ 	 */
+ 	reinit_completion(&cci->master[0].irq_complete);
+ 	writel(CCI_RESET_CMD_MASK, cci->base + CCI_RESET_CMD);
++	/* Match the downstream camera stack's mask-then-command reset sequence. */
++	writel(0x1, cci->base + CCI_RESET_CMD);
+ 
+ 	if (!wait_for_completion_timeout(&cci->master[0].irq_complete,
+ 					 CCI_TIMEOUT)) {
+@@ -288,9 +326,125 @@ static int cci_reset(struct cci *cci)
+ 	return 0;
+ }
+ 
++static int cci_init_for_first_xfer(struct cci *cci)
++{
++	int ret = 0;
++
++	mutex_lock(&cci->init_lock);
++	if (cci->needs_first_xfer_init) {
++		ret = cci_reset(cci);
++		if (!ret)
++			cci->needs_first_xfer_init = false;
++	}
++	mutex_unlock(&cci->init_lock);
++
++	return ret;
++}
++
++static void cci_log_tlmm_levels(struct cci *cci, const char *stage)
++{
++	u32 sda_ctl, sda_io, scl_ctl, scl_io;
++
++	if (!cci->tlmm_base)
++		return;
++
++	sda_ctl = readl(cci->tlmm_base + TLMM_GPIO39_CTL_REG);
++	sda_io = readl(cci->tlmm_base + TLMM_GPIO39_IO_REG);
++	scl_ctl = readl(cci->tlmm_base + TLMM_GPIO40_CTL_REG);
++	scl_io = readl(cci->tlmm_base + TLMM_GPIO40_IO_REG);
++	dev_err(cci->dev,
++		"%s CCI pads: GPIO39 SDA=%u ctl=%#x GPIO40 SCL=%u ctl=%#x\n",
++		stage, (unsigned int)!!(sda_io & BIT(0)), sda_ctl,
++		(unsigned int)!!(scl_io & BIT(0)), scl_ctl);
++}
++
++static int cci_probe_gpio_input_levels(struct cci *cci)
++{
++	int ret;
++
++	if (!cci->pinctrl || !cci->pins_default || !cci->pins_gpio_probe)
++		return 0;
++
++	ret = pinctrl_select_state(cci->pinctrl, cci->pins_gpio_probe);
++	if (ret) {
++		dev_err(cci->dev, "failed to select GPIO-input probe state: %d\n",
++			ret);
++		return ret;
++	}
++
++	usleep_range(1000, 2000);
++	cci_log_tlmm_levels(cci, "CCI pads in GPIO-input probe state");
++
++	ret = pinctrl_select_state(cci->pinctrl, cci->pins_default);
++	if (ret) {
++		dev_err(cci->dev, "failed to restore CCI pinmux: %d\n", ret);
++		return ret;
++	}
++
++	cci_log_tlmm_levels(cci, "CCI pads after restoring CCI mux");
++	return 0;
++}
++
++static void cci_log_camera_gpios(struct cci *cci);
++
++static void cci_gpio_idle_sample_work(struct work_struct *work)
++{
++	struct cci *cci = container_of(to_delayed_work(work), struct cci,
++					       gpio_idle_sample_work);
++	int ret;
++
++	dev_info(cci->dev, "sampling CCI pads after sensor power-down\n");
++	ret = cci_probe_gpio_input_levels(cci);
++	cci_log_camera_gpios(cci);
++	if (ret)
++		dev_warn(cci->dev, "post-power-down GPIO sample failed: %d\n", ret);
++}
++
++static void cci_cancel_gpio_idle_sample(void *data)
++{
++	struct cci *cci = data;
++
++	cancel_delayed_work_sync(&cci->gpio_idle_sample_work);
++}
++
++static void cci_log_camera_gpios(struct cci *cci)
++{
++	static const struct {
++		unsigned int gpio;
++		u32 ctl_reg;
++		u32 io_reg;
++	} gpios[] = {
++		{ 34, TLMM_GPIO34_CTL_REG, TLMM_GPIO34_IO_REG },
++		{ 43, TLMM_GPIO43_CTL_REG, TLMM_GPIO43_IO_REG },
++		{ 58, TLMM_GPIO58_CTL_REG, TLMM_GPIO58_IO_REG },
++		{ 93, TLMM_GPIO93_CTL_REG, TLMM_GPIO93_IO_REG },
++	};
++	unsigned int i;
++
++	if (!cci->tlmm_base)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(gpios); i++) {
++		u32 ctl = readl(cci->tlmm_base + gpios[i].ctl_reg);
++		u32 io = readl(cci->tlmm_base + gpios[i].io_reg);
++
++		dev_err(cci->dev,
++			"camera GPIO%u raw: ctl=%#x io=%#x oe=%u mux=%u pull=%u input=%u output=%u\n",
++			gpios[i].gpio, ctl, io, (unsigned int)!!(ctl & BIT(9)),
++			(unsigned int)((ctl >> 2) & 0x7),
++			(unsigned int)(ctl & 0x3),
++			(unsigned int)!!(io & BIT(0)),
++			(unsigned int)!!(io & BIT(1)));
++	}
++}
++
+ static int cci_run_queue(struct cci *cci, u8 master, u8 queue)
+ {
+ 	u32 val;
++	int ret;
++
++	cci_log_tlmm_levels(cci, "before queue start");
++	cci_log_camera_gpios(cci);
+ 
+ 	val = readl(cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, queue));
+ 	writel(val, cci->base + CCI_I2C_Mm_Qn_EXEC_WORD_CNT(master, queue));
+@@ -303,7 +457,21 @@ static int cci_run_queue(struct cci *cci, u8 master, u8 queue)
+ 					 CCI_TIMEOUT)) {
+ 		dev_err(cci->dev, "master %d queue %d timeout\n",
+ 			master, queue);
+-		cci_reset(cci);
++		dev_err(cci->dev,
++			"master %u queue %u state: irq=%#x mask=%#x words=%u exec=%u cmd=%#x report=%#x\n",
++			master, queue,
++			readl(cci->base + CCI_IRQ_STATUS_0),
++			readl(cci->base + CCI_IRQ_MASK_0),
++			readl(cci->base + CCI_I2C_Mm_Qn_CUR_WORD_CNT(master, queue)),
++			readl(cci->base + CCI_I2C_Mm_Qn_EXEC_WORD_CNT(master, queue)),
++			readl(cci->base + CCI_I2C_Mm_Qn_CUR_CMD(master, queue)),
++			readl(cci->base + CCI_I2C_Mm_Qn_REPORT_STATUS(master, queue)));
++		cci_log_tlmm_levels(cci, "at queue timeout");
++		ret = cci_reset(cci);
++		if (ret)
++			dev_err(cci->dev, "CCI reset after queue timeout failed: %d\n", ret);
++		else
++			cci_log_tlmm_levels(cci, "after controller reset");
+ 		return -ETIMEDOUT;
+ 	}
+ 
+@@ -424,7 +592,17 @@ static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
+ 	struct cci *cci = cci_master->cci;
+ 	int i, ret;
+ 
++	cci_log_tlmm_levels(cci, "CCI xfer entry before runtime get");
++	cci_log_camera_gpios(cci);
+ 	ret = pm_runtime_get_sync(cci->dev);
++	if (ret < 0)
++		goto err;
++	cci_log_tlmm_levels(cci, "CCI xfer after runtime get before queue");
++	cci_log_camera_gpios(cci);
++	ret = cci_init_for_first_xfer(cci);
++	if (ret < 0)
++		goto err;
++	ret = cci_probe_gpio_input_levels(cci);
+ 	if (ret < 0)
+ 		goto err;
+ 
+@@ -446,6 +624,9 @@ static int cci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
+ 		ret = num;
+ 
+ err:
++	if (ret < 0 && num > 0 && msgs[0].addr == 0x10)
++		schedule_delayed_work(&cci->gpio_idle_sample_work,
++				      msecs_to_jiffies(50));
+ 	pm_runtime_put_autosuspend(cci->dev);
+ 
+ 	return ret;
+@@ -505,7 +686,9 @@ static void cci_put_of_node(void *data)
+ static int cci_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct device_node *tlmm_np;
+ 	struct resource *r;
++	struct resource tlmm_res;
+ 	struct cci *cci;
+ 	int ret, i;
+ 	u32 val;
+@@ -515,6 +698,31 @@ static int cci_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	cci->dev = dev;
++	INIT_DELAYED_WORK(&cci->gpio_idle_sample_work, cci_gpio_idle_sample_work);
++	ret = devm_add_action_or_reset(dev, cci_cancel_gpio_idle_sample, cci);
++	if (ret)
++		return ret;
++	mutex_init(&cci->init_lock);
++	cci->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(cci->pinctrl)) {
++		ret = PTR_ERR(cci->pinctrl);
++		if (ret == -EPROBE_DEFER)
++			return ret;
++		dev_dbg(dev, "no CCI pinctrl handle for line sampling: %d\n", ret);
++		cci->pinctrl = NULL;
++	} else {
++		cci->pins_default = pinctrl_lookup_state(cci->pinctrl, "default");
++		if (IS_ERR(cci->pins_default))
++			cci->pins_default = NULL;
++		cci->pins_gpio_probe = pinctrl_lookup_state(cci->pinctrl,
++							   "gpio-probe");
++		if (IS_ERR(cci->pins_gpio_probe))
++			cci->pins_gpio_probe = NULL;
++		cci->pins_gpio_high = pinctrl_lookup_state(cci->pinctrl,
++							   "gpio-high");
++		if (IS_ERR(cci->pins_gpio_high))
++			cci->pins_gpio_high = NULL;
++	}
+ 	platform_set_drvdata(pdev, cci);
+ 	cci->data = device_get_match_data(dev);
+ 	if (!cci->data)
+@@ -568,6 +776,31 @@ static int cci_probe(struct platform_device *pdev)
+ 	if (IS_ERR(cci->base))
+ 		return PTR_ERR(cci->base);
+ 
++	tlmm_np = of_parse_phandle(dev->of_node, "qcom,tlmm", 0);
++	if (tlmm_np) {
++		ret = of_address_to_resource(tlmm_np, 0, &tlmm_res);
++		if (ret) {
++			dev_warn(dev, "failed to locate TLMM for CCI line diagnostics\n");
++		} else {
++			cci->tlmm_base = devm_ioremap(dev, tlmm_res.start,
++						      resource_size(&tlmm_res));
++			if (!cci->tlmm_base)
++				dev_warn(dev, "failed to map TLMM for CCI line diagnostics\n");
++		}
++		of_node_put(tlmm_np);
++	}
++	cci_log_tlmm_levels(cci, "CCI probe before clock enable");
++	cci_log_camera_gpios(cci);
++	if (cci->pins_gpio_high && cci->pins_default) {
++		/* Android requests CCI SDA/SCL with GPIOF_OUT_INIT_HIGH first. */
++		ret = pinctrl_select_state(cci->pinctrl, cci->pins_gpio_high);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "failed to precharge CCI lines\n");
++		usleep_range(1000, 2000);
++		cci_log_tlmm_levels(cci, "CCI pads after Android GPIO-high precharge");
++	}
++
+ 	/* Clocks */
+ 
+ 	ret = devm_clk_bulk_get_all(dev, &cci->clocks);
+@@ -580,6 +813,14 @@ static int cci_probe(struct platform_device *pdev)
+ 	ret = cci_enable_clocks(cci);
+ 	if (ret < 0)
+ 		return ret;
++	if (cci->pins_gpio_high && cci->pins_default) {
++		/* Stock camera setup enables the CCI clocks before selecting this mux. */
++		dev_info(dev, "CCI GPIO precharge held until CCI clocks are enabled\n");
++		ret = pinctrl_select_state(cci->pinctrl, cci->pins_default);
++		if (ret)
++			goto disable_clocks;
++		cci_log_tlmm_levels(cci, "CCI pads after clocked mux restore");
++	}
+ 
+ 	/* Interrupt */
+ 
+@@ -600,6 +841,9 @@ static int cci_probe(struct platform_device *pdev)
+ 	ret = cci_reset(cci);
+ 	if (ret < 0)
+ 		goto disable_clocks;
++	cci->needs_first_xfer_init = true;
++	cci_log_tlmm_levels(cci, "CCI probe after reset before adapters");
++	cci_log_camera_gpios(cci);
+ 
+ 	pm_runtime_set_autosuspend_delay(dev, MSEC_PER_SEC);
+ 	ret = devm_pm_runtime_set_active_enabled(dev);
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index 5c52007f9..762a51682 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -826,6 +826,14 @@ config VIDEO_S5KJN1
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called s5kjn1.
+ 
++config VIDEO_S5KHM2_ID_PROBE
++	bool "Xiaomi veux S5KHM2 one-shot identity probe"
++	depends on I2C && COMMON_CLK && GPIOLIB && REGULATOR
++	help
++	  Power the stock veux main camera briefly, read its candidate 16-bit
++	  identity register once, then power it back down. This does not expose
++	  a V4L2 subdevice, program mode tables, or start CSI streaming.
++
+ config VIDEO_T4KA3
+ 	tristate "Toshiba T4KA3 sensor support"
+ 	depends on ACPI || COMPILE_TEST
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index d04bd5724..6a624cc84 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -133,6 +133,7 @@ obj-$(CONFIG_VIDEO_S5K3M5) += s5k3m5.o
+ obj-$(CONFIG_VIDEO_S5K5BAF) += s5k5baf.o
+ obj-$(CONFIG_VIDEO_S5K6A3) += s5k6a3.o
+ obj-$(CONFIG_VIDEO_S5KJN1) += s5kjn1.o
++obj-$(CONFIG_VIDEO_S5KHM2_ID_PROBE) += s5khm2_probe.o
+ obj-$(CONFIG_VIDEO_SAA6588) += saa6588.o
+ obj-$(CONFIG_VIDEO_SAA6752HS) += saa6752hs.o
+ obj-$(CONFIG_VIDEO_SAA7110) += saa7110.o
+diff --git a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+index dac8d2ecf..aaf9db508 100644
+--- a/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
++++ b/drivers/media/platform/qcom/camss/camss-csiphy-3ph-1-0.c
+@@ -144,6 +144,112 @@ csiphy_lane_regs lane_regs_sa8775p[] = {
+ 	{0x0664, 0x7F, 0x00, CSIPHY_DEFAULT_PARAMS},
+ };
+ 
++/* CSIPHY 1.2.1 D-PHY sequence from Qualcomm downstream.
++ * Copyright (c) 2018-2021, The Linux Foundation.
++ */
++static const struct csiphy_lane_regs lane_regs_sm6375[] = {
++	{ 0x0030, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0900, 0x05, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0908, 0x10, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0904, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0904, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0004, 0x0C, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x002C, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0034, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0010, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x001C, 0x08, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x003C, 0xB8, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0008, 0x10, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0000, 0x8D, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x000c, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0038, 0xFE, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0014, 0x80, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0028, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0024, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0800, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0884, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0730, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C80, 0x05, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C88, 0x10, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C84, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C84, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0704, 0x0C, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x072C, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0734, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0710, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x071C, 0x08, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x073C, 0xB8, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0708, 0x10, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0700, 0x80, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x070c, 0xA5, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0738, 0x1F, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0714, 0x80, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0728, 0x04, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0724, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0800, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0884, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0230, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0A00, 0x05, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0A08, 0x10, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0A04, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0A04, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0204, 0x0C, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x022C, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0234, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0210, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x021C, 0x08, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x023C, 0xB8, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0208, 0x10, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0200, 0x8D, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x020c, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0238, 0xFE, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0214, 0x80, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0228, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0224, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0800, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0884, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0430, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0B00, 0x05, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0B08, 0x10, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0B04, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0B04, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0404, 0x0C, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x042C, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0434, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0410, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x041C, 0x08, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x043C, 0xB8, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0408, 0x10, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0400, 0x8D, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x040c, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0438, 0xFE, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0414, 0x80, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0428, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0424, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0800, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0884, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0630, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C00, 0x05, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C08, 0x10, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C04, 0x00, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0C04, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0604, 0x0C, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x062C, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0634, 0x07, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0610, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x061C, 0x08, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x063C, 0xB8, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0608, 0x10, 0x00, CSIPHY_SETTLE_CNT_LOWER_BYTE },
++	{ 0x0600, 0x8D, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x060c, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0638, 0xFE, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0614, 0x80, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0628, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0624, 0x00, 0x00, CSIPHY_DNP_PARAMS },
++	{ 0x0800, 0x02, 0x00, CSIPHY_DEFAULT_PARAMS },
++	{ 0x0884, 0x01, 0x00, CSIPHY_DEFAULT_PARAMS },
++};
++
+ /* GEN2 1.0 2PH */
+ static const struct
+ csiphy_lane_regs lane_regs_sdm845[] = {
+@@ -1130,6 +1236,7 @@ static bool csiphy_is_gen2(u32 version)
+ 
+ 	switch (version) {
+ 	case CAMSS_2290:
++	case CAMSS_6375:
+ 	case CAMSS_6150:
+ 	case CAMSS_6350:
+ 	case CAMSS_7280:
+@@ -1175,9 +1282,14 @@ static void csiphy_lanes_enable(struct csiphy_device *csiphy,
+ 	writel_relaxed(val, csiphy->base +
+ 		       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 7));
+ 
+-	val = 0x00;
++	val = csiphy->camss->res->version == CAMSS_6375 ? 0x03 : 0x00;
+ 	writel_relaxed(val, csiphy->base +
+ 		       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 0));
++	if (csiphy->camss->res->version == CAMSS_6375) {
++		usleep_range(1000, 1100);
++		writel_relaxed(0x02, csiphy->base +
++			       CSIPHY_3PH_CMN_CSI_COMMON_CTRLn(regs->offset, 0));
++	}
+ 
+ 	if (csiphy_is_gen2(csiphy->camss->res->version))
+ 		csiphy_gen2_config_lanes(csiphy, settle_cnt);
+@@ -1217,6 +1329,10 @@ static int csiphy_init(struct csiphy_device *csiphy)
+ 	regs->common_status_offset = 0xb0;
+ 
+ 	switch (csiphy->camss->res->version) {
++	case CAMSS_6375:
++		regs->lane_regs = &lane_regs_sm6375[0];
++		regs->lane_array_size = ARRAY_SIZE(lane_regs_sm6375);
++		break;
+ 	case CAMSS_845:
+ 		regs->lane_regs = &lane_regs_sdm845[0];
+ 		regs->lane_array_size = ARRAY_SIZE(lane_regs_sdm845);
+diff --git a/drivers/media/platform/qcom/camss/camss-vfe.c b/drivers/media/platform/qcom/camss/camss-vfe.c
+index 319d19158..102459d0b 100644
+--- a/drivers/media/platform/qcom/camss/camss-vfe.c
++++ b/drivers/media/platform/qcom/camss/camss-vfe.c
+@@ -342,6 +342,7 @@ static u32 vfe_src_pad_code(struct vfe_line *line, u32 sink_code,
+ 		break;
+ 	case CAMSS_660:
+ 	case CAMSS_2290:
++	case CAMSS_6375:
+ 	case CAMSS_6150:
+ 	case CAMSS_6350:
+ 	case CAMSS_7280:
+@@ -2029,6 +2030,7 @@ static int vfe_bpl_align_pix(struct vfe_device *vfe)
+ 
+ 	switch (vfe->camss->res->version) {
+ 	case CAMSS_2290:
++	case CAMSS_6375:
+ 		/* The alignment/bpl depends solely on the pixel format and is
+ 		 * computed dynamically in camss_format_get_bpl_alignment().
+ 		 */
+diff --git a/drivers/media/platform/qcom/camss/camss.c b/drivers/media/platform/qcom/camss/camss.c
+index 2123f6388..9bb8557e7 100644
+--- a/drivers/media/platform/qcom/camss/camss.c
++++ b/drivers/media/platform/qcom/camss/camss.c
+@@ -722,6 +722,28 @@ static const struct camss_subdev_resources csiphy_res_2290[] = {
+ 	}
+ };
+ 
++static const struct camss_subdev_resources csiphy_res_sm6375[] = {
++	/* CSIPHY0 */
++	{
++		.regulators = {
++			{ .supply = "mipi-csi-vdd1", .init_load_uA = 16200 },
++			{ .supply = "mipi-csi-vdd2", .init_load_uA = 9000 },
++		},
++		.clock = { "top_ahb", "ahb", "csiphy0", "csiphy0_timer" },
++		.clock_rate = { { 0 },
++				{ 0 },
++				{ 256000000, 384000000 },
++				{ 100000000, 300000000 } },
++		.reg = { "csiphy0" },
++		.interrupt = { "csiphy0" },
++		.csiphy = {
++			.id = 0,
++			.hw_ops = &csiphy_ops_3ph_1_0,
++			.formats = &csiphy_formats_sdm845
++		}
++	}
++};
++
+ static const struct camss_subdev_resources csid_res_2290[] = {
+ 	/* CSID0 */
+ 	{
+@@ -5565,6 +5587,22 @@ static const struct camss_resources qcm2290_resources = {
+ 	.vfe_num = ARRAY_SIZE(vfe_res_2290),
+ };
+ 
++/* Initial SM6375 bring-up covers only CSIPHY0, CSID0 and TFE0. */
++static const struct camss_resources sm6375_resources = {
++	.version = CAMSS_6375,
++	.csiphy_res = csiphy_res_sm6375,
++	.csid_res = csid_res_2290,
++	.vfe_res = vfe_res_2290,
++	/* The SM6375 provider has no verified camera bandwidth routes yet.
++	 * This probe-only profile exposes the media graph without streaming.
++	 */
++	.icc_res = NULL,
++	.icc_path_num = 0,
++	.csiphy_num = 1,
++	.csid_num = 1,
++	.vfe_num = 1,
++};
++
+ static const struct camss_resources qcs8300_resources = {
+ 	.version = CAMSS_8300,
+ 	.pd_name = "top",
+@@ -5745,6 +5783,7 @@ static const struct of_device_id camss_dt_match[] = {
+ 	{ .compatible = "qcom,msm8953-camss", .data = &msm8953_resources },
+ 	{ .compatible = "qcom,msm8996-camss", .data = &msm8996_resources },
+ 	{ .compatible = "qcom,qcm2290-camss", .data = &qcm2290_resources },
++	{ .compatible = "qcom,sm6375-camss", .data = &sm6375_resources },
+ 	{ .compatible = "qcom,qcs8300-camss", .data = &qcs8300_resources },
+ 	{ .compatible = "qcom,sa8775p-camss", .data = &sa8775p_resources },
+ 	{ .compatible = "qcom,sc7280-camss", .data = &sc7280_resources },
+diff --git a/drivers/media/platform/qcom/camss/camss.h b/drivers/media/platform/qcom/camss/camss.h
+index 93d691c8a..2e0e60c51 100644
+--- a/drivers/media/platform/qcom/camss/camss.h
++++ b/drivers/media/platform/qcom/camss/camss.h
+@@ -84,6 +84,7 @@ enum camss_version {
+ 	CAMSS_2290,
+ 	CAMSS_6150,
+ 	CAMSS_6350,
++	CAMSS_6375,
+ 	CAMSS_7280,
+ 	CAMSS_8x16,
+ 	CAMSS_8x39,
+diff --git a/drivers/media/i2c/s5khm2_probe.c b/drivers/media/i2c/s5khm2_probe.c
+new file mode 100644
+index 000000000..99f393d8e
+--- /dev/null
++++ b/drivers/media/i2c/s5khm2_probe.c
+@@ -0,0 +1,245 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * One-shot identity probe for the stock Xiaomi veux S5KHM2 main camera.
++ * It deliberately does not expose a V4L2 subdevice or program sensor modes.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/regulator/consumer.h>
++#include <linux/slab.h>
++
++#define VEUX_S5KHM2_ID_REG	0x0000
++#define VEUX_S5KHM2_ID		0x1ad2
++#define VEUX_S5KHM2_XCLK_HZ	19200000
++
++struct veux_s5khm2_probe {
++	struct clk *xclk;
++	struct regulator *vdig;
++	struct gpio_desc *reset;
++	struct gpio_desc *vana;
++	struct gpio_desc *vio;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_default;
++	struct pinctrl_state *pins_sleep;
++	bool vdig_enabled;
++	bool xclk_enabled;
++};
++
++static void veux_s5khm2_power_off(struct device *dev,
++				  struct veux_s5khm2_probe *probe)
++{
++	if (probe->xclk_enabled) {
++		clk_disable_unprepare(probe->xclk);
++		probe->xclk_enabled = false;
++	}
++
++	/* reset is active-low; logical 1 asserts it. */
++	gpiod_set_value_cansleep(probe->reset, 1);
++	msleep(1);
++	gpiod_set_value_cansleep(probe->vio, 0);
++	msleep(1);
++	gpiod_set_value_cansleep(probe->vana, 0);
++	msleep(1);
++
++	if (probe->vdig_enabled) {
++		int ret = regulator_disable(probe->vdig);
++
++		if (ret)
++			dev_warn(dev, "failed to disable VDIG: %d\n", ret);
++		else
++			probe->vdig_enabled = false;
++	}
++	msleep(1);
++}
++
++static int veux_s5khm2_power_on(struct veux_s5khm2_probe *probe)
++{
++	int ret;
++
++	/* Stock slot-0 order: VDIG, VANA, VIO, reset release, then MCLK. */
++	gpiod_set_value_cansleep(probe->reset, 1);
++
++	ret = regulator_enable(probe->vdig);
++	if (ret)
++		return ret;
++	probe->vdig_enabled = true;
++	msleep(1);
++
++	gpiod_set_value_cansleep(probe->vana, 1);
++	msleep(1);
++	gpiod_set_value_cansleep(probe->vio, 1);
++	msleep(1);
++	gpiod_set_value_cansleep(probe->reset, 0);
++	msleep(1);
++
++	ret = clk_set_rate(probe->xclk, VEUX_S5KHM2_XCLK_HZ);
++	if (ret)
++		return ret;
++
++	ret = clk_prepare_enable(probe->xclk);
++	if (ret)
++		return ret;
++	probe->xclk_enabled = true;
++	msleep(13);
++
++	return 0;
++}
++
++static int veux_s5khm2_read_id(struct i2c_client *client, u16 *id)
++{
++	u8 address[] = { VEUX_S5KHM2_ID_REG >> 8, VEUX_S5KHM2_ID_REG & 0xff };
++	u8 data[2];
++	struct i2c_msg messages[] = {
++		{
++			.addr = client->addr,
++			.len = sizeof(address),
++			.buf = address,
++		},
++		{
++			.addr = client->addr,
++			.flags = I2C_M_RD,
++			.len = sizeof(data),
++			.buf = data,
++		},
++	};
++	int ret;
++
++	ret = i2c_transfer(client->adapter, messages, ARRAY_SIZE(messages));
++	if (ret < 0)
++		return ret;
++	if (ret != 2)
++		return -EIO;
++
++	*id = ((u16)data[0] << 8) | data[1];
++	return 0;
++}
++
++static int veux_s5khm2_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct veux_s5khm2_probe *probe;
++	u16 id = 0;
++	int ret;
++
++	if (client->addr != 0x10)
++		return dev_err_probe(dev, -EINVAL, "unexpected 7-bit address 0x%02x\n",
++				     client->addr);
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return dev_err_probe(dev, -EOPNOTSUPP, "adapter lacks raw I2C transfers\n");
++
++	probe = devm_kzalloc(dev, sizeof(*probe), GFP_KERNEL);
++	if (!probe)
++		return -ENOMEM;
++
++	probe->vdig = devm_regulator_get(dev, "vdig");
++	if (IS_ERR(probe->vdig))
++		return dev_err_probe(dev, PTR_ERR(probe->vdig), "failed to get VDIG\n");
++
++	probe->xclk = devm_clk_get(dev, "xclk");
++	if (IS_ERR(probe->xclk))
++		return dev_err_probe(dev, PTR_ERR(probe->xclk), "failed to get MCLK\n");
++
++	probe->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(probe->reset))
++		return dev_err_probe(dev, PTR_ERR(probe->reset), "failed to get reset GPIO\n");
++
++	probe->vana = devm_gpiod_get(dev, "vana", GPIOD_OUT_LOW);
++	if (IS_ERR(probe->vana))
++		return dev_err_probe(dev, PTR_ERR(probe->vana), "failed to get VANA GPIO\n");
++
++	probe->vio = devm_gpiod_get(dev, "vio", GPIOD_OUT_LOW);
++	if (IS_ERR(probe->vio))
++		return dev_err_probe(dev, PTR_ERR(probe->vio), "failed to get VIO GPIO\n");
++
++	probe->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(probe->pinctrl))
++		return dev_err_probe(dev, PTR_ERR(probe->pinctrl),
++				     "failed to get camera pinctrl\n");
++	probe->pins_default = pinctrl_lookup_state(probe->pinctrl, "default");
++	if (IS_ERR(probe->pins_default))
++		return dev_err_probe(dev, PTR_ERR(probe->pins_default),
++				     "failed to get active camera pins\n");
++	probe->pins_sleep = pinctrl_lookup_state(probe->pinctrl, "sleep");
++	if (IS_ERR(probe->pins_sleep))
++		return dev_err_probe(dev, PTR_ERR(probe->pins_sleep),
++				     "failed to get sleep camera pins\n");
++
++	/*
++	 * The stock Android sensor sequence enables cam_clk (CAMSS_TOP_GDSC)
++	 * before MCLK. Keep the same domain on for GPIO, clock, and CCI access.
++	 */
++	pm_runtime_set_suspended(dev);
++	pm_runtime_enable(dev);
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret < 0) {
++		pm_runtime_disable(dev);
++		return dev_err_probe(dev, ret, "failed to enable CAMSS power domain\n");
++	}
++	dev_info(dev, "CAMSS top power domain enabled for sensor probe\n");
++
++	ret = pinctrl_select_state(probe->pinctrl, probe->pins_default);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to select active camera pins\n");
++		goto power_domain_off;
++	}
++
++	ret = veux_s5khm2_power_on(probe);
++	if (!ret) {
++		dev_info(dev,
++			 "powered for ID read: reset=%d VANA=%d VIO=%d VDIG=%d xclk=%lu\n",
++			 gpiod_get_value_cansleep(probe->reset),
++			 gpiod_get_value_cansleep(probe->vana),
++			 gpiod_get_value_cansleep(probe->vio),
++			 regulator_is_enabled(probe->vdig),
++			 clk_get_rate(probe->xclk));
++		ret = veux_s5khm2_read_id(client, &id);
++	}
++	veux_s5khm2_power_off(dev, probe);
++	ret = pinctrl_select_state(probe->pinctrl, probe->pins_sleep) ?: ret;
++
++power_domain_off:
++	pm_runtime_put_sync(dev);
++	pm_runtime_disable(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "one-shot sensor ID read failed\n");
++	if (id != VEUX_S5KHM2_ID)
++		return dev_err_probe(dev, -ENODEV,
++				     "sensor ID 0x%04x did not match expected 0x%04x\n",
++				     id, VEUX_S5KHM2_ID);
++
++	dev_info(dev, "sensor ID 0x%04x matched; sensor powered back down\n", id);
++	return 0;
++}
++
++static const struct of_device_id veux_s5khm2_of_match[] = {
++	{ .compatible = "xiaomi,veux-s5khm2-id-probe" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, veux_s5khm2_of_match);
++
++static const struct i2c_device_id veux_s5khm2_id[] = {
++	{ "veux-s5khm2-id-probe", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, veux_s5khm2_id);
++
++static struct i2c_driver veux_s5khm2_driver = {
++	.driver = {
++		.name = "veux-s5khm2-id-probe",
++		.of_match_table = veux_s5khm2_of_match,
++	},
++	.probe = veux_s5khm2_probe,
++	.id_table = veux_s5khm2_id,
++};
++module_i2c_driver(veux_s5khm2_driver);
++
++MODULE_DESCRIPTION("Xiaomi veux S5KHM2 one-shot identity probe");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Activate the active USIM provisioning session
+Wants=veux-wifi.service
+After=veux-wifi.service tqftpserv.service ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/veux-sim-start
+TimeoutStartSec=100
+RemainAfterExit=yes

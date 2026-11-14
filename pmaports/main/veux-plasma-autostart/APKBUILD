@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+maintainer="hikari <me@metantesan.com>"
+pkgname=veux-plasma-autostart
+pkgver=1
+pkgrel=4
+pkgdesc="Plasma Mobile automatic startup for the veux development image"
+url="https://postmarketos.org"
+arch="noarch"
+license="GPL-2.0-only"
+depends="plasma-mobile systemd"
+source="veux-plasma-mobile.service veux-plasma-prepare veux-plasma-start 60-veux-plasma.preset"
+options="!check !archcheck"
+
+package() {
+	install -Dm644 "$srcdir/veux-plasma-mobile.service" \
+		"$pkgdir/usr/lib/systemd/system/veux-plasma-mobile.service"
+	install -Dm755 "$srcdir/veux-plasma-prepare" \
+		"$pkgdir/usr/libexec/veux-plasma-prepare"
+	install -Dm755 "$srcdir/veux-plasma-start" \
+		"$pkgdir/usr/libexec/veux-plasma-start"
+	install -Dm644 "$srcdir/60-veux-plasma.preset" \
+		"$pkgdir/usr/lib/systemd/system-preset/60-veux-plasma.preset"
+	mkdir -p "$pkgdir/etc/systemd/system/graphical.target.wants" \
+		"$pkgdir/etc/systemd/system/mainline-bringup.target.wants"
+	ln -s /usr/lib/systemd/system/veux-plasma-mobile.service \
+		"$pkgdir/etc/systemd/system/graphical.target.wants/veux-plasma-mobile.service"
+	ln -s /usr/lib/systemd/system/veux-plasma-mobile.service \
+		"$pkgdir/etc/systemd/system/mainline-bringup.target.wants/veux-plasma-mobile.service"
+}
+
+# Filled in the staged copy by stage-rootfs-packages.py.
+sha512sums=""

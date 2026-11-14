@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Plasma Mobile on Xiaomi veux
+Wants=dbus.socket
+After=dbus.socket systemd-user-sessions.service plymouth-start.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+Before=graphical.target
+ConditionPathExists=/dev/tty0
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+User=user
+PAMName=login
+WorkingDirectory=~
+Environment=LANG=C.UTF-8
+Environment=XDG_SEAT=seat0
+Environment=XDG_VTNR=1
+ExecStartPre=/usr/libexec/veux-plasma-prepare
+ExecStartPre=-+/usr/bin/plymouth quit
+ExecStart=/usr/libexec/veux-plasma-start
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+
+[Install]
+WantedBy=graphical.target mainline-bringup.target

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Start audio initialization in the background
+
+[Timer]
+OnBootSec=5s
+AccuracySec=1s
+Unit=veux-audio.service
+
+[Install]
+WantedBy=mainline-bringup.target multi-user.target

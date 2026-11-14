@@ -1,0 +1,829 @@
+Subject: [PATCH 06/11] SYV690 charging driver
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index b89ef40df..a50f415e6 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -1202,4 +1202,41 @@ config MACSMC_POWER
+ 
+ 	  Say Y or M here if you have an Apple Silicon based Mac.
+ 
++config CHARGER_SYV690
++	tristate "Xiaomi veux SYV690 conservative USB charger"
++	depends on I2C && OF
++	select REGMAP_I2C
++	help
++	  Limited SYV690 revision 0 monitoring with no charger programming by
++	  default. A separate experimental control option uses the battery gauge
++	  for temperature policy. No fast-charge negotiation or OTG support.
++	  The device is polled rather than using a charger IRQ.
++
++config CHARGER_SYV690_CONTROL
++	bool "Enable experimental SYV690 charger programming"
++	depends on CHARGER_SYV690
++	help
++	  Allow the experimental charging profile to program the IC. The first
++	  control image caused a phone boot loop and its cause is unresolved.
++	  Leave disabled for monitor-only diagnostics with regmap writes blocked.
++	  Do not enable until the charger reset has been isolated on hardware.
++
++config CHARGER_SYV690_SWITCH
++	bool "Enable explicit SYV690 charge-bit diagnostic"
++	depends on CHARGER_SYV690 && !CHARGER_SYV690_CONTROL
++	help
++	  Expose an explicit charge enable/inhibit switch through sysfs while
++	  keeping boot, polling and power-management paths read-only. Only the
++	  charge-enable bit may be written. Re-enabling requires the inherited
++	  charging profile, a healthy gauge and unchanged conservative limits.
++
++config CHARGER_SYV690_PD_LIMIT
++	bool "Bound SYV690 input current to the fixed USB-PD contract"
++	depends on CHARGER_SYV690 && !CHARGER_SYV690_CONTROL && CHARGER_SYV690_SWITCH
++	help
++	  Allow the board driver to update only the SYV690 input-current field.
++	  Select 2 A only while TCPM reports an online 5 V PD contract with at
++	  least 2 A available and the battery/source checks pass; otherwise restore
++	  500 mA. Charge current, voltage and charge enable are left unchanged.
++
+ endif # POWER_SUPPLY
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index f3c0d1006..0392af32a 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -135,3 +135,4 @@ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
+ obj-$(CONFIG_MACSMC_POWER)	+= macsmc-power.o
+ obj-$(CONFIG_CHARGER_MAX77759)	+= max77759_charger.o
++obj-$(CONFIG_CHARGER_SYV690)	+= syv690_charger.o
+diff --git a/Documentation/devicetree/bindings/power/supply/xiaomi,veux-syv690.yaml b/Documentation/devicetree/bindings/power/supply/xiaomi,veux-syv690.yaml
+new file mode 100644
+index 000000000..68ab71a7f
+--- /dev/null
++++ b/Documentation/devicetree/bindings/power/supply/xiaomi,veux-syv690.yaml
+@@ -0,0 +1,47 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/power/supply/xiaomi,veux-syv690.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Xiaomi veux SYV690 USB charging profile
++
++maintainers:
++  - hikari <me@metantesan.com>
++
++description: |
++  Initial revision 0 support with fixed conservative USB charging limits and
++  polling. A battery fuel gauge provides presence, voltage and temperature.
++  The driver defaults to monitoring without programming the charger. Its
++  separate experimental control profile has not passed hardware validation.
++
++properties:
++  compatible:
++    const: xiaomi,veux-syv690
++
++  reg:
++    maxItems: 1
++
++  xiaomi,battery-gauge:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Fuel gauge implementing presence, temperature and voltage.
++
++required:
++  - compatible
++  - reg
++  - xiaomi,battery-gauge
++
++additionalProperties: false
++
++examples:
++  - |
++    i2c {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        charger@6a {
++            compatible = "xiaomi,veux-syv690";
++            reg = <0x6a>;
++            xiaomi,battery-gauge = <&battery_gauge>;
++        };
++    };
+diff --git a/drivers/power/supply/syv690_charger.c b/drivers/power/supply/syv690_charger.c
+new file mode 100644
+index 000000000..bfa5568f1
+--- /dev/null
++++ b/drivers/power/supply/syv690_charger.c
+@@ -0,0 +1,710 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Conservative SYV690 USB charging, initially limited to revision 0 on veux.
++ * Register subset checked against Xiaomi's GPL bq2589x SYV690 implementation.
++ * No DP/DM negotiation, charge pumps, OTG, reset or undocumented registers.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#define SYV690_INPUT		0x00
++#define SYV690_CONTROL		0x03
++#define SYV690_STATUS		0x0b
++#define SYV690_FAULT		0x0c
++#define SYV690_ID		0x14
++#define SYV690_CHARGE_EN		BIT(4)
++#define SYV690_POWER_GOOD	BIT(2)
++#define SYV690_CHARGE_STATE	GENMASK(4, 3)
++#define SYV690_POLL_MS		5000
++#define SYV690_SAFE_IINLIM_UA	500000
++#define SYV690_PD_IINLIM_UA	2000000
++#define SYV690_PD_MIN_VOLTAGE_UV	4500000
++#define SYV690_PD_MAX_VOLTAGE_UV	5500000
++#define SYV690_TCPM_PSY_NAME	"tcpm-source-psy-2-004e"
++
++struct syv690_limit {
++	unsigned int reg;
++	unsigned int mask;
++	unsigned int value;
++};
++
++/* Keep these below the captured battery/charger limits during bring-up. */
++static const struct syv690_limit syv690_limits[] = {
++	/* HIZ off, input 100 + 8 * 50 = 500mA; retain external ILIM pin. */
++	{ 0x00, BIT(7) | GENMASK(5, 0), 8 },
++	/* Relative input voltage headroom 600mV. Keep hot/cold thresholds. */
++	{ 0x01, GENMASK(4, 0), 6 },
++	/* Disable ICO, HVDCP, MAXC and DP/DM detection/negotiation. */
++	{ 0x02, GENMASK(4, 0), 0 },
++	{ 0x03, BIT(5), 0 }, /* OTG off */
++	{ 0x04, 0xff, 8 }, /* PumpX off, charge 8 * 64 = 512mA */
++	{ 0x05, 0xff, 0x11 }, /* Precharge and termination 128mA */
++	{ 0x06, GENMASK(7, 2), 22 << 2 }, /* 3840 + 22 * 16 = 4192mV */
++	/* Termination on, watchdog off, safety timer on/8h, cool current 20%. */
++	{ 0x07, BIT(7) | GENMASK(5, 0), 0x8b },
++	{ 0x08, 0xff, 0 }, /* No IR compensation; die regulation 60C */
++	{ 0x09, BIT(4), 0 }, /* Retain warm-temperature voltage reduction */
++	{ 0x0d, BIT(7), 0 }, /* Relative VINDPM, as in the SYV690 stock path */
++};
++
++struct syv690 {
++	struct device *dev;
++	struct regmap *regmap;
++	struct power_supply *battery;
++	struct power_supply *psy;
++	/* Serializes monitor, sysfs controls and suspend register access. */
++	struct mutex lock;
++	struct delayed_work poll;
++	unsigned int status;
++	unsigned int fault;
++	int last_error;
++	bool enabled;
++	bool inhibit;
++	bool suspended;
++	bool switch_restore_allowed;
++	unsigned int inherited[ARRAY_SIZE(syv690_limits)];
++};
++
++static int syv690_set_charge(struct syv690 *chip, bool enable)
++{
++	int ret;
++
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) &&
++	    !IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH))
++		return -EOPNOTSUPP;
++	ret = regmap_update_bits(chip->regmap, SYV690_CONTROL,
++				 SYV690_CHARGE_EN, enable ? SYV690_CHARGE_EN : 0);
++	if (!ret)
++		chip->enabled = enable;
++	return ret;
++}
++
++static int syv690_check_limits(struct syv690 *chip)
++{
++	unsigned int value;
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(syv690_limits); i++) {
++		const struct syv690_limit *limit = &syv690_limits[i];
++
++		ret = regmap_read(chip->regmap, limit->reg, &value);
++		if (ret)
++			return ret;
++		if ((value & limit->mask) != limit->value)
++			return -EIO;
++	}
++	return 0;
++}
++
++static int syv690_configure(struct syv690 *chip)
++{
++	int i, ret;
++
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL))
++		return -EOPNOTSUPP;
++	ret = syv690_set_charge(chip, false);
++	if (ret)
++		return ret;
++	for (i = 0; i < ARRAY_SIZE(syv690_limits); i++) {
++		const struct syv690_limit *limit = &syv690_limits[i];
++
++		ret = regmap_update_bits(chip->regmap, limit->reg,
++					 limit->mask, limit->value);
++		if (ret)
++			return ret;
++	}
++	return syv690_check_limits(chip);
++}
++
++static bool syv690_charge_allowed(bool present, int temp, int voltage,
++				  unsigned int fault, bool online, bool inhibit)
++{
++	/* Gauge reports deci-Celsius and microvolts. Use a narrow initial window. */
++	return present && temp >= 100 && temp <= 400 &&
++		voltage >= 2500000 && voltage <= 4450000 &&
++		!fault && online && !inhibit;
++}
++
++static int syv690_monitor(struct syv690 *chip)
++{
++	unsigned int control, latched;
++	int ret;
++
++	ret = regmap_read(chip->regmap, SYV690_STATUS, &chip->status);
++	if (ret)
++		return ret;
++	ret = regmap_read(chip->regmap, SYV690_FAULT, &latched);
++	if (ret)
++		return ret;
++	ret = regmap_read(chip->regmap, SYV690_FAULT, &chip->fault);
++	if (ret)
++		return ret;
++	chip->fault |= latched;
++	ret = regmap_read(chip->regmap, SYV690_CONTROL, &control);
++	if (!ret)
++		chip->enabled = !!(control & SYV690_CHARGE_EN);
++	return ret;
++}
++
++/*
++ * Xiaomi's downstream driver sets a 2 A input limit for DCP/MaxCharge. In
++ * mainline, use that limit only while TCPM confirms our fixed 5 V/2 A PD
++ * contract. Otherwise restore the inherited-safe 500 mA limit. Do not change
++ * charge-current, charge-voltage, or charge-enable fields here.
++ */
++static int syv690_sync_pd_input_limit(struct syv690 *chip)
++{
++	union power_supply_propval online = {}, usb_type = {}, voltage = {};
++	union power_supply_propval current_max = {}, present, temp, battery_voltage;
++	struct power_supply *tcpm;
++	unsigned int before, after, target = SYV690_SAFE_IINLIM_UA;
++	unsigned int code;
++	int ret;
++
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		return 0;
++
++	tcpm = power_supply_get_by_name(SYV690_TCPM_PSY_NAME);
++	if (tcpm) {
++		ret = power_supply_get_property(tcpm, POWER_SUPPLY_PROP_ONLINE, &online);
++		if (!ret && online.intval)
++			ret = power_supply_get_property(tcpm, POWER_SUPPLY_PROP_USB_TYPE,
++							&usb_type);
++		if (!ret && online.intval && usb_type.intval == POWER_SUPPLY_USB_TYPE_PD)
++			ret = power_supply_get_property(tcpm, POWER_SUPPLY_PROP_VOLTAGE_NOW,
++							&voltage);
++		if (!ret && online.intval && usb_type.intval == POWER_SUPPLY_USB_TYPE_PD)
++			ret = power_supply_get_property(tcpm, POWER_SUPPLY_PROP_CURRENT_MAX,
++							&current_max);
++
++		if (!ret && online.intval && usb_type.intval == POWER_SUPPLY_USB_TYPE_PD &&
++		    voltage.intval >= SYV690_PD_MIN_VOLTAGE_UV &&
++		    voltage.intval <= SYV690_PD_MAX_VOLTAGE_UV &&
++		    current_max.intval >= SYV690_PD_IINLIM_UA &&
++		    !power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_PRESENT,
++					       &present) &&
++		    !power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_TEMP,
++					       &temp) &&
++		    !power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_VOLTAGE_NOW,
++					       &battery_voltage) &&
++		    syv690_charge_allowed(present.intval, temp.intval,
++					 battery_voltage.intval, chip->fault,
++					 chip->status & SYV690_POWER_GOOD,
++					 chip->inhibit || chip->suspended))
++			target = SYV690_PD_IINLIM_UA;
++
++		power_supply_put(tcpm);
++	}
++
++	/* Xiaomi's field uses a 100 mA base and 50 mA steps. */
++	code = (target - 100000) / 50000;
++	ret = regmap_read(chip->regmap, SYV690_INPUT, &before);
++	if (ret)
++		return ret;
++	if (before & BIT(7))
++		return -EPERM;
++	if ((before & GENMASK(5, 0)) == code)
++		return 0;
++
++	ret = regmap_update_bits(chip->regmap, SYV690_INPUT, GENMASK(5, 0), code);
++	if (ret)
++		return ret;
++	ret = regmap_read(chip->regmap, SYV690_INPUT, &after);
++	if (ret)
++		return ret;
++	if ((after & GENMASK(5, 0)) != code)
++		return -EIO;
++
++	dev_info(chip->dev, "PD input limit %u -> %u mA (reg00 %02x -> %02x)\n",
++		  100000U + (unsigned int)(before & GENMASK(5, 0)) * 50000U,
++		  target / 1000,
++		 before, after);
++	return 0;
++}
++
++static int syv690_manual_switch(struct syv690 *chip, bool enable)
++{
++	union power_supply_propval present, temp, voltage;
++	unsigned int value, before, after;
++	int i, ret;
++
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH))
++		return -EOPNOTSUPP;
++	if (enable) {
++		/* Only restore a bit that was already enabled by the inherited profile. */
++		if (!chip->switch_restore_allowed)
++			return -EPERM;
++		ret = syv690_monitor(chip);
++		if (ret)
++			return ret;
++		ret = power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_PRESENT,
++						&present);
++		if (ret)
++			return ret;
++		ret = power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_TEMP, &temp);
++		if (ret)
++			return ret;
++		ret = power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_VOLTAGE_NOW,
++						&voltage);
++		if (ret)
++			return ret;
++		if (!syv690_charge_allowed(present.intval, temp.intval, voltage.intval,
++					   chip->fault, chip->status & SYV690_POWER_GOOD, false))
++			return -EPERM;
++		/* Do not restore after firmware or another actor changes the profile. */
++		for (i = 0; i < ARRAY_SIZE(syv690_limits); i++) {
++			ret = regmap_read(chip->regmap, syv690_limits[i].reg, &value);
++			if (ret)
++				return ret;
++			if ((value & syv690_limits[i].mask) != chip->inherited[i])
++				return -ESTALE;
++		}
++		ret = regmap_read(chip->regmap, 0x00, &value);
++		if (ret)
++			return ret;
++		if ((value & BIT(7)) || 100000 + (value & 0x3f) * 50000 > 500000)
++			return -ERANGE;
++		ret = regmap_read(chip->regmap, 0x04, &value);
++		if (ret)
++			return ret;
++		if ((value & 0x7f) * 64000 > 512000)
++			return -ERANGE;
++		ret = regmap_read(chip->regmap, 0x06, &value);
++		if (ret)
++			return ret;
++		if (3840000 + ((value >> 2) & 0x3f) * 16000 > 4448000)
++			return -ERANGE;
++	}
++	ret = regmap_read(chip->regmap, SYV690_CONTROL, &before);
++	if (ret)
++		return ret;
++	if (enable && (before & BIT(5)))
++		return -EPERM;
++	dev_info(chip->dev, "manual charge-bit request: enable=%u before=%02x\n",
++		 enable, before);
++	ret = syv690_set_charge(chip, enable);
++	if (ret)
++		return ret;
++	ret = regmap_read(chip->regmap, SYV690_CONTROL, &after);
++	if (ret)
++		return ret;
++	dev_info(chip->dev, "manual charge-bit readback: %02x\n", after);
++	if (((before ^ after) & ~SYV690_CHARGE_EN) ||
++	    (!!(after & SYV690_CHARGE_EN) != enable))
++		return -EIO;
++	return 0;
++}
++
++/* Caller holds lock. Any missing measurement or limit mismatch inhibits charge. */
++static int syv690_refresh(struct syv690 *chip)
++{
++	union power_supply_propval present, temp, voltage;
++	unsigned int latched;
++	bool allow;
++	int ret, stop_ret;
++
++	ret = regmap_read(chip->regmap, SYV690_STATUS, &chip->status);
++	if (ret)
++		goto stop;
++	/* Preserve latched faults for this interval as well as current faults. */
++	ret = regmap_read(chip->regmap, SYV690_FAULT, &latched);
++	if (ret)
++		goto stop;
++	ret = regmap_read(chip->regmap, SYV690_FAULT, &chip->fault);
++	if (ret)
++		goto stop;
++	chip->fault |= latched;
++	ret = power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_PRESENT, &present);
++	if (ret)
++		goto stop;
++	ret = power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_TEMP, &temp);
++	if (ret)
++		goto stop;
++	ret = power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_VOLTAGE_NOW, &voltage);
++	if (ret)
++		goto stop;
++	ret = syv690_check_limits(chip);
++	if (ret)
++		goto stop;
++	allow = syv690_charge_allowed(present.intval, temp.intval, voltage.intval,
++				      chip->fault, chip->status & SYV690_POWER_GOOD,
++				      chip->inhibit || chip->suspended);
++	ret = syv690_set_charge(chip, allow);
++	if (ret)
++		goto stop;
++	return 0;
++stop:
++	stop_ret = syv690_set_charge(chip, false);
++	if (stop_ret)
++		dev_err_ratelimited(chip->dev, "cannot inhibit charging: %d\n", stop_ret);
++	return ret;
++}
++
++static void syv690_poll(struct work_struct *work)
++{
++	struct syv690 *chip = container_of(to_delayed_work(work), struct syv690, poll);
++	unsigned int status, fault;
++	bool enabled, changed;
++	int error;
++
++	mutex_lock(&chip->lock);
++	status = chip->status;
++	fault = chip->fault;
++	enabled = chip->enabled;
++	error = chip->last_error;
++	chip->last_error = IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) ?
++		syv690_refresh(chip) : syv690_monitor(chip);
++	if (!chip->last_error && IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		chip->last_error = syv690_sync_pd_input_limit(chip);
++	changed = status != chip->status || fault != chip->fault ||
++		enabled != chip->enabled || error != chip->last_error;
++	if (chip->last_error)
++		dev_err_ratelimited(chip->dev, "charger monitor error: %d\n",
++				    chip->last_error);
++	if (!chip->suspended)
++		schedule_delayed_work(&chip->poll, msecs_to_jiffies(SYV690_POLL_MS));
++	mutex_unlock(&chip->lock);
++	if (changed)
++		power_supply_changed(chip->psy);
++}
++
++static enum power_supply_property syv690_properties[] = {
++	POWER_SUPPLY_PROP_MODEL_NAME,
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
++	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
++};
++
++static int syv690_get_property(struct power_supply *psy,
++			       enum power_supply_property prop,
++			       union power_supply_propval *val)
++{
++	struct syv690 *chip = power_supply_get_drvdata(psy);
++	unsigned int value;
++	int state, ret = 0;
++
++	mutex_lock(&chip->lock);
++	switch (prop) {
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = "SYV690";
++		break;
++	case POWER_SUPPLY_PROP_ONLINE:
++		val->intval = !!(chip->status & SYV690_POWER_GOOD);
++		ret = chip->last_error;
++		break;
++	case POWER_SUPPLY_PROP_STATUS:
++		state = FIELD_GET(SYV690_CHARGE_STATE, chip->status);
++		if (!(chip->status & SYV690_POWER_GOOD) || !chip->enabled)
++			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		else if (state == 3)
++			val->intval = POWER_SUPPLY_STATUS_FULL;
++		else if (state)
++			val->intval = POWER_SUPPLY_STATUS_CHARGING;
++		else
++			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		ret = chip->last_error;
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = chip->fault ? POWER_SUPPLY_HEALTH_UNSPEC_FAILURE :
++			POWER_SUPPLY_HEALTH_GOOD;
++		ret = chip->last_error;
++		break;
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		ret = regmap_read(chip->regmap, 0x00, &value);
++		if (!ret)
++			val->intval = 100000 + (value & 0x3f) * 50000;
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
++		ret = regmap_read(chip->regmap, 0x04, &value);
++		if (!ret)
++			val->intval = (value & 0x7f) * 64000;
++		break;
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX:
++		ret = regmap_read(chip->regmap, 0x06, &value);
++		if (!ret)
++			val->intval = 3840000 + ((value >> 2) & 0x3f) * 16000;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
++		val->intval = chip->inhibit ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
++			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++	mutex_unlock(&chip->lock);
++	return ret;
++}
++
++static int syv690_set_property(struct power_supply *psy,
++			       enum power_supply_property prop,
++			       const union power_supply_propval *val)
++{
++	struct syv690 *chip = power_supply_get_drvdata(psy);
++	int ret;
++
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) &&
++	    !IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH))
++		return -EOPNOTSUPP;
++	if (prop != POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR ||
++	    (val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
++	     val->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE))
++		return -EINVAL;
++	mutex_lock(&chip->lock);
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH) &&
++	    !IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL)) {
++		ret = syv690_manual_switch(chip, val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO);
++		if (!ret)
++			chip->inhibit = val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++	} else {
++		chip->inhibit = val->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
++		ret = syv690_refresh(chip);
++	}
++	chip->last_error = ret;
++	mutex_unlock(&chip->lock);
++	power_supply_changed(psy);
++	return ret;
++}
++
++static int syv690_property_is_writeable(struct power_supply *psy,
++					enum power_supply_property prop)
++{
++	return (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) ||
++		IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH)) &&
++		prop == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
++}
++
++static const struct power_supply_desc syv690_supply = {
++	.name = "syv690-usb",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.properties = syv690_properties,
++	.num_properties = ARRAY_SIZE(syv690_properties),
++	.get_property = syv690_get_property,
++	.set_property = syv690_set_property,
++	.property_is_writeable = syv690_property_is_writeable,
++	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
++		BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
++};
++
++static void syv690_stop_monitor(struct syv690 *chip)
++{
++	mutex_lock(&chip->lock);
++	chip->suspended = true;
++	mutex_unlock(&chip->lock);
++	cancel_delayed_work_sync(&chip->poll);
++}
++
++static void syv690_cleanup(void *data)
++{
++	struct syv690 *chip = data;
++
++	syv690_stop_monitor(chip);
++	mutex_lock(&chip->lock);
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) && syv690_set_charge(chip, false))
++		dev_err(chip->dev, "failed to stop charging on cleanup\n");
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT) &&
++	    syv690_sync_pd_input_limit(chip))
++		dev_err(chip->dev, "failed to restore safe input limit on cleanup\n");
++	mutex_unlock(&chip->lock);
++}
++
++static void syv690_cancel_poll(void *data)
++{
++	struct syv690 *chip = data;
++
++	syv690_stop_monitor(chip);
++}
++
++static bool syv690_reg_writeable(struct device *dev, unsigned int reg)
++{
++	int i;
++
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL))
++		return (IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH) && reg == SYV690_CONTROL) ||
++			(IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT) && reg == SYV690_INPUT);
++	for (i = 0; i < ARRAY_SIZE(syv690_limits); i++)
++		if (syv690_limits[i].reg == reg)
++			return true;
++	return false;
++}
++
++static const struct regmap_config syv690_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = SYV690_ID,
++	.cache_type = REGCACHE_NONE,
++	.writeable_reg = syv690_reg_writeable,
++};
++
++static bool syv690_id_supported(unsigned int id)
++{
++	/* PN1/revision0, and no register reset in progress. */
++	return (id & (BIT(7) | GENMASK(5, 3) | GENMASK(1, 0))) == BIT(3);
++}
++
++static int syv690_probe(struct i2c_client *client)
++{
++	struct power_supply_config cfg = {};
++	struct device *dev = &client->dev;
++	struct syv690 *chip;
++	unsigned int id, initial;
++	int i, ret;
++
++	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++	chip->dev = dev;
++	chip->regmap = devm_regmap_init_i2c(client, &syv690_regmap);
++	if (IS_ERR(chip->regmap))
++		return PTR_ERR(chip->regmap);
++	ret = regmap_read(chip->regmap, SYV690_ID, &id);
++	if (ret)
++		return ret;
++	/* PN1/revision0 only: never program a different part using this profile. */
++	if (!syv690_id_supported(id))
++		return dev_err_probe(dev, -ENODEV, "unsupported charger ID: %#x\n", id);
++	chip->battery = devm_power_supply_get_by_reference(dev, "xiaomi,battery-gauge");
++	if (IS_ERR(chip->battery))
++		return dev_err_probe(dev, PTR_ERR(chip->battery), "battery gauge reference\n");
++	if (!chip->battery)
++		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for battery gauge\n");
++	/* Preserve the inherited volatile configuration before taking control. */
++	for (i = 0; i < ARRAY_SIZE(syv690_limits); i++) {
++		ret = regmap_read(chip->regmap, syv690_limits[i].reg, &initial);
++		if (ret)
++			return dev_err_probe(dev, ret, "initial charger read failed\n");
++		dev_info(dev, "inherited register %02x=%02x\n",
++			 syv690_limits[i].reg, initial);
++		chip->inherited[i] = initial & syv690_limits[i].mask;
++	}
++	ret = devm_mutex_init(dev, &chip->lock);
++	if (ret)
++		return ret;
++	INIT_DELAYED_WORK(&chip->poll, syv690_poll);
++	i2c_set_clientdata(client, chip);
++	ret = devm_add_action_or_reset(dev, syv690_cleanup, chip);
++	if (ret)
++		return ret;
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL)) {
++		ret = syv690_configure(chip);
++		if (ret)
++			return dev_err_probe(dev, ret, "charger limit setup/readback failed\n");
++		chip->last_error = syv690_refresh(chip);
++	} else {
++		chip->last_error = syv690_monitor(chip);
++		chip->switch_restore_allowed = !chip->last_error && chip->enabled;
++		if (!chip->last_error && IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT)) {
++			ret = syv690_sync_pd_input_limit(chip);
++			if (ret)
++				dev_warn(dev, "initial PD input-limit sync failed: %d\n", ret);
++		}
++	}
++	cfg.drv_data = chip;
++	cfg.fwnode = dev_fwnode(dev);
++	chip->psy = devm_power_supply_register(dev, &syv690_supply, &cfg);
++	if (IS_ERR(chip->psy))
++		return PTR_ERR(chip->psy);
++	/* Stop the worker before devres unregisters the power supply. */
++	ret = devm_add_action_or_reset(dev, syv690_cancel_poll, chip);
++	if (ret)
++		return ret;
++	schedule_delayed_work(&chip->poll, msecs_to_jiffies(SYV690_POLL_MS));
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL))
++		dev_info(dev, "SYV690 rev0: input500mA charge512mA voltage4192mV; gauge policy10-40C\n");
++	else if (IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		dev_info(dev, "SYV690 rev0: 500 mA fallback; 2 A only on valid 5 V/2 A PD\n");
++	else if (IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH))
++		dev_info(dev, "SYV690 rev0: manual switch only; no automatic charger writes\n");
++	else
++		dev_info(dev, "SYV690 rev0: monitor-only; charger configuration writes blocked\n");
++	return 0;
++}
++
++static int syv690_suspend(struct device *dev)
++{
++	struct syv690 *chip = dev_get_drvdata(dev);
++	int ret;
++
++	syv690_stop_monitor(chip);
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) &&
++	    !IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		return 0;
++	mutex_lock(&chip->lock);
++	ret = 0;
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL))
++		ret = syv690_set_charge(chip, false);
++	if (!ret && IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		ret = syv690_sync_pd_input_limit(chip);
++	if (ret) {
++		chip->suspended = false;
++		schedule_delayed_work(&chip->poll, 0);
++	}
++	mutex_unlock(&chip->lock);
++	return ret;
++}
++
++static int syv690_resume(struct device *dev)
++{
++	struct syv690 *chip = dev_get_drvdata(dev);
++	int ret;
++
++	mutex_lock(&chip->lock);
++	ret = IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) ? syv690_configure(chip) : 0;
++	chip->last_error = ret;
++	chip->suspended = false;
++	if (!ret)
++		schedule_delayed_work(&chip->poll, 0);
++	mutex_unlock(&chip->lock);
++	return ret;
++}
++
++static void syv690_shutdown(struct i2c_client *client)
++{
++	struct syv690 *chip = i2c_get_clientdata(client);
++	int ret;
++
++	syv690_stop_monitor(chip);
++	if (!IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL) &&
++	    !IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		return;
++	mutex_lock(&chip->lock);
++	ret = 0;
++	if (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL))
++		ret = syv690_set_charge(chip, false);
++	if (!ret && IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
++		ret = syv690_sync_pd_input_limit(chip);
++	mutex_unlock(&chip->lock);
++	if (ret)
++		dev_err(chip->dev, "failed to stop charging on shutdown\n");
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(syv690_pm, syv690_suspend, syv690_resume);
++
++static const struct of_device_id syv690_of_match[] = {
++	{ .compatible = "xiaomi,veux-syv690" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, syv690_of_match);
++
++static struct i2c_driver syv690_driver = {
++	.driver = {
++		.name = "syv690-charger",
++		.of_match_table = syv690_of_match,
++		.pm = pm_sleep_ptr(&syv690_pm),
++	},
++	.probe = syv690_probe,
++	.shutdown = syv690_shutdown,
++};
++module_i2c_driver(syv690_driver);
++
++MODULE_DESCRIPTION("Conservative SYV690 USB charger with battery gauge monitoring");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Package an already built mainline kernel; no second kernel compile.
+# Stage inputs/checksums with tools/stage-rootfs-packages.py.
+maintainer="hikari <me@metantesan.com>"
+pkgname=linux-xiaomi-veux-mainline
+pkgver=7.3.0
+pkgrel=6
+pkgdesc="Locally built Xiaomi veux mainline bring-up kernel"
+url="https://kernel.org"
+arch="aarch64"
+license="GPL-2.0-only"
+makedepends="kmod"
+options="!check !strip !tracedeps pmb:cross-native"
+source="Image kernel.config kernel.release modules.builtin modules.builtin.modinfo sm6375-xiaomi-veux.dtb"
+
+package() {
+	local release
+	release=$(cat "$srcdir/kernel.release")
+	install -Dm644 "$srcdir/Image" "$pkgdir/boot/vmlinuz"
+	install -Dm644 "$srcdir/kernel.config" "$pkgdir/boot/config"
+	install -Dm644 "$srcdir/sm6375-xiaomi-veux.dtb" \
+		"$pkgdir/boot/dtbs/qcom/sm6375-xiaomi-veux.dtb"
+	install -Dm644 "$srcdir/kernel.release" \
+		"$pkgdir/usr/share/kernel/xiaomi-veux-mainline/kernel.release"
+	# All drivers needed by the bring-up image are built in.
+	mkdir -p "$pkgdir/usr/lib/modules/$release"
+	# kmod's trigger treats a directory without modules.order as uninstalled
+	# and deletes its indexes. This package intentionally ships no .ko files.
+	printf '' > "$pkgdir/usr/lib/modules/$release/modules.order"
+	install -m644 "$srcdir/modules.builtin" "$srcdir/modules.builtin.modinfo" \
+		"$pkgdir/usr/lib/modules/$release/"
+	depmod -b "$pkgdir" -m /usr/lib/modules "$release"
+}
+
+# Filled in the staged copy by stage-rootfs-packages.py.
+sha512sums=""

@@ -1,0 +1,234 @@
+Subject: [PATCH 05/11] Adreno 619 GPU bring-up
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_catalog.c b/drivers/gpu/drm/msm/adreno/a6xx_catalog.c
+index 90a0c7ffb..9a4401dca 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_catalog.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_catalog.c
+@@ -845,7 +845,7 @@ static const struct adreno_info a6xx_gpus[] = {
+ 		.gmem = SZ_512K,
+ 		.quirks = ADRENO_QUIRK_4GB_VA,
+ 		.inactive_period = DRM_MSM_INACTIVE_PERIOD,
+-		.funcs = &a6xx_gpu_funcs,
++		.funcs = &a6xx_gmuwrapper_funcs,
+ 		.zapfw = "a615_zap.mdt",
+ 		.a6xx = &(const struct a6xx_info) {
+ 			.hwcg = a615_hwcg,
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+index 6d49c51df..72be99a4b 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -500,7 +500,7 @@ int a6xx_sptprac_enable(struct a6xx_gmu *gmu)
+ 			gmu_read(gmu, REG_A6XX_GMU_SPTPRAC_PWR_CLK_STATUS));
+ 	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ /* Disable CPU control of SPTP power power collapse */
+diff --git a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+index 081e79ea4..79484695f 100644
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1134,7 +1134,9 @@ int a6xx_zap_shader_init(struct msm_gpu *gpu)
+ 	if (loaded)
+ 		return 0;
+ 
++	dev_info(gpu->dev->dev, "GPU-DIAG signed zap begin\n");
+ 	ret = adreno_zap_shader_load(gpu, GPU_PAS_ID);
++	dev_info(gpu->dev->dev, "GPU-DIAG signed zap end: %d\n", ret);
+ 
+ 	loaded = !ret;
+ 	return ret;
+@@ -1209,8 +1211,11 @@ static int hw_init(struct msm_gpu *gpu)
+ 
+ 	gpu_write(gpu, REG_A6XX_RBBM_SECVID_TSB_CNTL, 0);
+ 
+-	if (adreno_is_a619_holi(adreno_gpu))
+-		a6xx_sptprac_enable(gmu);
++	if (adreno_is_a619_holi(adreno_gpu)) {
++		ret = a6xx_sptprac_enable(gmu);
++		if (ret)
++			return ret;
++	}
+ 
+ 	/*
+ 	 * Disable the trusted memory range - we don't actually supported secure
+@@ -2173,52 +2178,71 @@ static int a6xx_pm_resume(struct msm_gpu *gpu)
+ 	int ret;
+ 
+ 	gpu->needs_hw_init = true;
+-
+ 	trace_msm_gpu_resume(0);
+-
+-	mutex_lock(&a6xx_gpu->gmu.lock);
++	mutex_lock(&gmu->lock);
+ 
+ 	opp = dev_pm_opp_find_freq_ceil(&gpu->pdev->dev, &freq);
+ 	if (IS_ERR(opp)) {
+ 		ret = PTR_ERR(opp);
+-		goto err_set_opp;
++		goto out;
+ 	}
++
++	dev_info(gmu->dev, "GPU-DIAG OPP begin: %lu\n", freq);
++	ret = dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
+ 	dev_pm_opp_put(opp);
++	dev_info(gmu->dev, "GPU-DIAG OPP end: %d\n", ret);
++	if (ret)
++		goto out;
+ 
+-	/* Set the core clock and bus bw, having VDD scaling in mind */
+-	dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
++	dev_info(gmu->dev, "GPU-DIAG CX domain begin\n");
++	ret = pm_runtime_resume_and_get(gmu->dev);
++	dev_info(gmu->dev, "GPU-DIAG CX domain end: %d\n", ret);
++	if (ret < 0)
++		goto clear_opp;
+ 
+-	pm_runtime_resume_and_get(gmu->dev);
+-	pm_runtime_resume_and_get(gmu->gxpd);
++	dev_info(gmu->dev, "GPU-DIAG GX domain begin\n");
++	ret = pm_runtime_resume_and_get(gmu->gxpd);
++	dev_info(gmu->dev, "GPU-DIAG GX domain end: %d\n", ret);
++	if (ret < 0)
++		goto put_cx;
+ 
++	dev_info(gmu->dev, "GPU-DIAG GPU clocks begin\n");
+ 	ret = clk_bulk_prepare_enable(gpu->nr_clocks, gpu->grp_clks);
++	dev_info(gmu->dev, "GPU-DIAG GPU clocks end: %d\n", ret);
+ 	if (ret)
+-		goto err_bulk_clk;
++		goto put_gx;
+ 
++	dev_info(gmu->dev, "GPU-DIAG wrapper clocks begin\n");
+ 	ret = clk_bulk_prepare_enable(gmu->nr_clocks, gmu->clocks);
+-	if (ret) {
+-		clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
+-		goto err_bulk_clk;
+-	}
+-
+-	if (adreno_is_a619_holi(adreno_gpu))
+-		a6xx_sptprac_enable(gmu);
++	dev_info(gmu->dev, "GPU-DIAG wrapper clocks end: %d\n", ret);
++	if (ret)
++		goto disable_gpu_clocks;
+ 
+-	/* If anything goes south, tear the GPU down piece by piece.. */
+-	if (ret) {
+-err_bulk_clk:
+-		pm_runtime_put(gmu->gxpd);
+-		pm_runtime_put(gmu->dev);
+-		dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
++	if (adreno_is_a619_holi(adreno_gpu)) {
++		dev_info(gmu->dev, "GPU-DIAG SPTPRAC begin\n");
++		ret = a6xx_sptprac_enable(gmu);
++		dev_info(gmu->dev, "GPU-DIAG SPTPRAC end: %d\n", ret);
++		if (ret)
++			goto disable_gmu_clocks;
+ 	}
+-err_set_opp:
+-	mutex_unlock(&a6xx_gpu->gmu.lock);
+ 
+-	if (!ret) {
+-		msm_devfreq_resume(gpu);
+-		a6xx_llc_activate(a6xx_gpu);
+-	}
++	mutex_unlock(&gmu->lock);
++	msm_devfreq_resume(gpu);
++	a6xx_llc_activate(a6xx_gpu);
++	return 0;
+ 
++disable_gmu_clocks:
++	clk_bulk_disable_unprepare(gmu->nr_clocks, gmu->clocks);
++disable_gpu_clocks:
++	clk_bulk_disable_unprepare(gpu->nr_clocks, gpu->grp_clks);
++put_gx:
++	pm_runtime_put(gmu->gxpd);
++put_cx:
++	pm_runtime_put(gmu->dev);
++clear_opp:
++	dev_pm_opp_set_opp(&gpu->pdev->dev, NULL);
++out:
++	mutex_unlock(&gmu->lock);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_device.c b/drivers/gpu/drm/msm/adreno/adreno_device.c
+index 05c77fe27..4b65367d9 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -46,6 +46,24 @@ static const struct adreno_gpulist *gpulists[] = {
+ 	&a8xx_gpulist,
+ };
+ 
++static bool adreno_machine_matches(const char *machine, uint32_t chip_id)
++{
++	struct device_node *gpucc;
++	bool available;
++
++	if (!machine || of_machine_is_compatible(machine))
++		return true;
++
++	/* Xiaomi firmware replaces the root compatible; retain the SoC guard. */
++	if (chip_id != 0x06010901 || strcmp(machine, "qcom,sm6375"))
++		return false;
++
++	gpucc = of_find_compatible_node(NULL, NULL, "qcom,sm6375-gpucc");
++	available = of_device_is_available(gpucc);
++	of_node_put(gpucc);
++	return available;
++}
++
+ static const struct adreno_info *adreno_info(uint32_t chip_id)
+ {
+ 	/* identify gpu: */
+@@ -53,7 +71,7 @@ static const struct adreno_info *adreno_info(uint32_t chip_id)
+ 		for (int j = 0; j < gpulists[i]->gpus_count; j++) {
+ 			const struct adreno_info *info = &gpulists[i]->gpus[j];
+ 
+-			if (info->machine && !of_machine_is_compatible(info->machine))
++			if (!adreno_machine_matches(info->machine, chip_id))
+ 				continue;
+ 
+ 			for (int k = 0; info->chip_ids[k]; k++)
+@@ -89,12 +107,16 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
+ 	 * otherwise
+ 	 */
+ 
++	dev_info(dev->dev, "GPU-DIAG firmware begin\n");
+ 	ret = adreno_load_fw(adreno_gpu);
++	dev_info(dev->dev, "GPU-DIAG firmware end: %d\n", ret);
+ 	if (ret)
+ 		return NULL;
+ 
+ 	if (gpu->funcs->ucode_load) {
++		dev_info(dev->dev, "GPU-DIAG microcode memory begin\n");
+ 		ret = gpu->funcs->ucode_load(gpu);
++		dev_info(dev->dev, "GPU-DIAG microcode memory end: %d\n", ret);
+ 		if (ret)
+ 			return NULL;
+ 	}
+@@ -105,7 +127,9 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
+ 	 */
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	dev_info(dev->dev, "GPU-DIAG runtime resume begin\n");
+ 	ret = pm_runtime_get_sync(&pdev->dev);
++	dev_info(dev->dev, "GPU-DIAG runtime resume end: %d\n", ret);
+ 	if (ret < 0) {
+ 		pm_runtime_put_noidle(&pdev->dev);
+ 		DRM_DEV_ERROR(dev->dev, "Couldn't power up the GPU: %d\n", ret);
+@@ -113,7 +137,9 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
+ 	}
+ 
+ 	mutex_lock(&gpu->lock);
++	dev_info(dev->dev, "GPU-DIAG hardware init begin\n");
+ 	ret = msm_gpu_hw_init(gpu);
++	dev_info(dev->dev, "GPU-DIAG hardware init end: %d\n", ret);
+ 	mutex_unlock(&gpu->lock);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(dev->dev, "gpu hw init failed: %d\n", ret);

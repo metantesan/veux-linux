@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-only
+maintainer="hikari <me@metantesan.com>"
+pkgname=veux-usbc-pd
+pkgver=1
+pkgrel=1
+pkgdesc="Load the HUSB311 USB-C PD controller modules on Xiaomi veux"
+url="https://postmarketos.org"
+arch="aarch64"
+license="GPL-2.0-only"
+depends="systemd kmod"
+source="veux-usbc-pd-modules.tar veux-usbc-pd-start veux-usbc-pd.service 60-veux-usbc-pd.preset"
+options="!check !archcheck"
+
+package() {
+	install -d "$pkgdir/usr/lib/veux-usbc-pd"
+	tar -xf "$srcdir/veux-usbc-pd-modules.tar" -C "$pkgdir/usr/lib/veux-usbc-pd"
+	install -Dm755 "$srcdir/veux-usbc-pd-start" "$pkgdir/usr/libexec/veux-usbc-pd-start"
+	install -Dm644 "$srcdir/veux-usbc-pd.service" "$pkgdir/usr/lib/systemd/system/veux-usbc-pd.service"
+	install -Dm644 "$srcdir/60-veux-usbc-pd.preset" "$pkgdir/usr/lib/systemd/system-preset/60-veux-usbc-pd.preset"
+	install -d "$pkgdir/etc/systemd/system/multi-user.target.wants"
+	ln -s /usr/lib/systemd/system/veux-usbc-pd.service \
+		"$pkgdir/etc/systemd/system/multi-user.target.wants/veux-usbc-pd.service"
+}
+
+# Filled in the staged copy by stage-rootfs-packages.py.
+sha512sums=""

@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Development phone image: all users may run sudo without a password.
+ALL ALL=(ALL:ALL) NOPASSWD: ALL

@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+disable veux-sim.service
+enable veux-sim.timer

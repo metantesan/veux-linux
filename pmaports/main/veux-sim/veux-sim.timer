@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Activate the primary USIM asynchronously after boot
+
+[Timer]
+OnBootSec=15s
+AccuracySec=1s
+Unit=veux-sim.service
+
+[Install]
+WantedBy=mainline-bringup.target multi-user.target

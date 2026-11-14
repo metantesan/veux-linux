@@ -1,0 +1,63 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# This bundle is valid only for the kernel that was used to build its modules.
+set -eu
+fail() { echo "veux-audio: $*" >&2; exit 1; }
+
+expected=136ffed60134c277c93bf70fc80719d95822945a22a11cd556d5f940e973df77
+[ "$(sha256sum /sys/kernel/notes | cut -d ' ' -f 1)" = "$expected" ] ||
+	fail 'kernel build differs from the bundled audio modules'
+
+adsp=
+for candidate in /sys/class/remoteproc/remoteproc*; do
+	[ -f "$candidate/firmware" ] || continue
+	if [ "$(cat "$candidate/firmware")" = qcom/xiaomi/veux/adsp.mdt ]; then
+		adsp=$candidate
+		break
+	fi
+done
+[ -n "$adsp" ] || fail 'audio DSP is unavailable'
+printf disabled > "$adsp/recovery"
+case "$(cat "$adsp/state")" in
+	offline) printf start > "$adsp/state" ;;
+	running) ;;
+	*) fail 'audio DSP is neither offline nor running' ;;
+esac
+
+for module in snd_soc_lpass_va_macro pinctrl_sm6115_lpass_lpi lpasscc_sm6115 \
+	snd_soc_lpass_rx_macro snd_soc_lpass_tx_macro; do
+	modprobe -d /usr/lib/veux-audio "$module" || fail "could not load $module"
+done
+
+ready=no
+for attempt in $(seq 1 15); do
+	if [ -L /sys/bus/platform/devices/a730000.codec/driver ] &&
+	   [ -L /sys/bus/platform/devices/a620000.codec/driver ]; then
+		ready=yes
+		break
+	fi
+	sleep 1
+done
+[ "$ready" = yes ] || fail 'audio clock providers did not bind'
+
+# The stock TX reset must precede the first controller/codec probe.
+if [ ! -L /sys/bus/platform/devices/a740000.soundwire/driver ]; then
+	insmod /usr/lib/veux-audio/veux_swr_tx_reset.ko || fail 'TX cold reset failed'
+	rmmod veux_swr_tx_reset || fail 'could not unload TX reset helper'
+fi
+modprobe -d /usr/lib/veux-audio soundwire_qcom || fail 'SoundWire driver failed'
+modprobe -d /usr/lib/veux-audio snd_soc_wcd937x || fail 'WCD937x driver failed'
+modprobe -d /usr/lib/veux-audio snd_soc_aw88261 || fail 'AW88261 speaker driver failed'
+modprobe -d /usr/lib/veux-audio snd_soc_sm8250 || fail 'sound-card driver failed'
+
+for attempt in $(seq 1 15); do
+	for card in /sys/devices/platform/sound/sound/card*; do
+		[ -r "$card/id" ] || continue
+		if [ "$(cat "$card/id")" = veux ]; then
+			echo 'veux-audio: ALSA card registered with stereo speaker backend'
+			exit 0
+		fi
+	done
+	sleep 1
+done
+fail 'ALSA card did not register'

@@ -1,0 +1,1654 @@
+Subject: [PATCH 11/11] Xiaomi veux board integration and kernel configuration
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/Documentation/devicetree/bindings/arm/qcom.yaml b/Documentation/devicetree/bindings/arm/qcom.yaml
+index ff8a35df7..c51575b02 100644
+--- a/Documentation/devicetree/bindings/arm/qcom.yaml
++++ b/Documentation/devicetree/bindings/arm/qcom.yaml
+@@ -1064,6 +1064,7 @@ properties:
+       - items:
+           - enum:
+               - sony,pdx225
++              - xiaomi,veux
+           - const: qcom,sm6375
+ 
+       - items:
+diff --git a/arch/arm64/boot/dts/qcom/Makefile b/arch/arm64/boot/dts/qcom/Makefile
+index 1c86e7e98..81db4da22 100644
+--- a/arch/arm64/boot/dts/qcom/Makefile
++++ b/arch/arm64/boot/dts/qcom/Makefile
+@@ -349,6 +349,8 @@ dtb-$(CONFIG_ARCH_QCOM)	+= sm6125-xiaomi-laurel-sprout.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm6125-xiaomi-willow.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm6350-sony-xperia-lena-pdx213.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm6375-sony-xperia-murray-pdx225.dtb
++DTC_FLAGS_sm6375-xiaomi-veux	:= -@
++dtb-$(CONFIG_ARCH_QCOM)	+= sm6375-xiaomi-veux.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm7125-xiaomi-curtana.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm7125-xiaomi-joyeuse.dtb
+ dtb-$(CONFIG_ARCH_QCOM)	+= sm7225-fairphone-fp4.dtb
+diff --git a/arch/arm64/boot/dts/qcom/sm6375.dtsi b/arch/arm64/boot/dts/qcom/sm6375.dtsi
+index 71a228597..69176a4e5 100644
+--- a/arch/arm64/boot/dts/qcom/sm6375.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm6375.dtsi
+@@ -5,6 +5,7 @@
+ 
+ #include <dt-bindings/clock/qcom,rpmcc.h>
+ #include <dt-bindings/clock/qcom,sm6375-gcc.h>
++#include <dt-bindings/clock/qcom,sm6375-dispcc.h>
+ #include <dt-bindings/clock/qcom,sm6375-gpucc.h>
+ #include <dt-bindings/dma/qcom-gpi.h>
+ #include <dt-bindings/firmware/qcom,scm.h>
+@@ -960,6 +961,35 @@ gcc: clock-controller@1400000 {
+ 			#reset-cells = <1>;
+ 		};
+ 
++		cci: cci@5c1b000 {
++			compatible = "qcom,sm6375-cci", "qcom,msm8996-cci";
++			reg = <0 0x05c1b000 0 0x1000>;
++			interrupts = <GIC_SPI 206 IRQ_TYPE_EDGE_RISING>;
++			clocks = <&gcc GCC_CAMSS_TOP_AHB_CLK>,
++				 <&gcc GCC_CAMSS_CCI_0_CLK>;
++			clock-names = "ahb", "cci";
++			assigned-clocks = <&gcc GCC_CAMSS_CCI_0_CLK>;
++			assigned-clock-rates = <37500000>;
++			power-domains = <&gcc CAMSS_TOP_GDSC>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++
++			cci_i2c0: i2c-bus@0 {
++				reg = <0>;
++				clock-frequency = <400000>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++			};
++
++			cci_i2c1: i2c-bus@1 {
++				reg = <1>;
++				clock-frequency = <400000>;
++				#address-cells = <1>;
++				#size-cells = <0>;
++			};
++		};
++
+ 		usb_1_hsphy: phy@162b000 {
+ 			compatible = "qcom,sm6375-usb-hs-phy", "qcom,usb-snps-hs-7nm-phy";
+ 			reg = <0 0x0162b000 0 0x400>;
+@@ -972,6 +1002,155 @@ usb_1_hsphy: phy@162b000 {
+ 			status = "disabled";
+ 		};
+ 
++		mdss: display-subsystem@5e00000 {
++			compatible = "qcom,sm6375-mdss";
++			reg = <0 0x05e00000 0 0x1000>;
++			reg-names = "mdss";
++			status = "disabled";
++
++			power-domains = <&dispcc MDSS_GDSC>;
++
++			clocks = <&gcc GCC_DISP_AHB_CLK>,
++					<&dispcc DISP_CC_MDSS_AHB_CLK>,
++					<&dispcc DISP_CC_MDSS_MDP_CLK>;
++			clock-names = "iface", "ahb", "core";
++
++			interrupts = <GIC_SPI 186 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-controller;
++			#interrupt-cells = <1>;
++
++			iommus = <&apps_smmu 0x820 0x2>;
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges = <0 0 0 0x10000000>;
++
++			mdss_mdp: display-controller@5e01000 {
++				compatible = "qcom,sm6375-dpu";
++				reg = <0x05e01000 0x8e030>,
++					<0x05eb0000 0x2008>;
++				reg-names = "mdp", "vbif";
++
++				clocks = <&gcc GCC_DISP_HF_AXI_CLK>,
++						<&dispcc DISP_CC_MDSS_AHB_CLK>,
++						<&dispcc DISP_CC_MDSS_ROT_CLK>,
++						<&dispcc DISP_CC_MDSS_MDP_LUT_CLK>,
++						<&dispcc DISP_CC_MDSS_MDP_CLK>,
++						<&dispcc DISP_CC_MDSS_VSYNC_CLK>,
++						<&gcc GCC_DISP_THROTTLE_CORE_CLK>;
++				clock-names = "bus",
++							"iface",
++							"rot",
++							"lut",
++							"core",
++							"vsync",
++							"throttle";
++
++				assigned-clocks = <&dispcc DISP_CC_MDSS_VSYNC_CLK>;
++				assigned-clock-rates = <19200000>;
++
++				power-domains = <&rpmpd SM6375_VDDCX>;
++
++				interrupt-parent = <&mdss>;
++				interrupts = <0>;
++
++				ports {
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					port@0 {
++						reg = <0>;
++						dpu_intf1_out: endpoint {
++							remote-endpoint = <&dsi0_in>;
++						};
++					};
++				};
++			};
++
++			mdss_dsi0: dsi@5e94000 {
++				compatible = "qcom,sm6375-dsi-ctrl", "qcom,mdss-dsi-ctrl";
++				reg = <0x05e94000 0x400>;
++				reg-names = "dsi_ctrl";
++				status = "disabled";
++
++				interrupt-parent = <&mdss>;
++				interrupts = <4>;
++
++				clocks = <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
++						<&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
++						<&dispcc DISP_CC_MDSS_PCLK0_CLK>,
++						<&dispcc DISP_CC_MDSS_ESC0_CLK>,
++						<&dispcc DISP_CC_MDSS_AHB_CLK>,
++						<&gcc GCC_DISP_HF_AXI_CLK>;
++				clock-names = "byte",
++							"byte_intf",
++							"pixel",
++							"core",
++							"iface",
++							"bus";
++
++				assigned-clocks = <&dispcc DISP_CC_MDSS_BYTE0_CLK_SRC>,
++								<&dispcc DISP_CC_MDSS_PCLK0_CLK_SRC>;
++				assigned-clock-parents = <&mdss_dsi0_phy 0>, <&mdss_dsi0_phy 1>;
++
++				power-domains = <&rpmpd SM6375_VDDMX>;
++
++				phys = <&mdss_dsi0_phy>;
++				phy-names = "dsi";
++
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				ports {
++					#address-cells = <1>;
++					#size-cells = <0>;
++
++					port@0 {
++						reg = <0>;
++						dsi0_in: endpoint {
++							remote-endpoint = <&dpu_intf1_out>;
++						};
++					};
++
++					port@1 {
++						reg = <1>;
++						dsi0_out: endpoint {
++						};
++					};
++				};
++			};
++
++			mdss_dsi0_phy: phy@5e94400 {
++				compatible = "qcom,sm6375-dsi-phy-7nm";
++				reg = <0x05e94400 0x200>,
++					<0x05e94600 0x280>,
++					<0x05e94900 0x264>;
++				reg-names = "dsi_phy",
++							"dsi_phy_lane",
++							"dsi_pll";
++
++				#clock-cells = <1>;
++				#phy-cells = <0>;
++				status = "disabled";
++
++				clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
++						<&rpmcc RPM_SMD_XO_CLK_SRC>;
++				clock-names = "iface", "ref";
++			};
++		};
++
++		dispcc: clock-controller@5f00000 {
++			compatible = "qcom,sm6375-dispcc";
++			reg = <0 0x05f00000 0 0x20000>;
++			clocks = <&rpmcc RPM_SMD_XO_CLK_SRC>,
++					<&gcc GCC_DISP_GPLL0_CLK_SRC>,
++					<&mdss_dsi0_phy 0>,
++					<&mdss_dsi0_phy 1>;
++			#clock-cells = <1>;
++			#reset-cells = <1>;
++			#power-domain-cells = <1>;
++			status = "disabled";
++		};
++
+ 		refgen: regulator@162f000 {
+ 			compatible = "qcom,sm6375-refgen-regulator",
+ 				     "qcom,sm8250-refgen-regulator";
+@@ -1077,6 +1256,53 @@ opp-202000000 {
+ 			};
+ 		};
+ 
++		ufs_mem_hc: ufshc@4804000 {
++			compatible = "qcom,sm6125-ufshc", "qcom,ufshc", "jedec,ufs-2.0";
++			reg = <0x0 0x04804000 0x0 0x3000>;
++			interrupts = <GIC_SPI 356 IRQ_TYPE_LEVEL_HIGH>;
++
++			clocks = <&gcc GCC_UFS_PHY_AXI_CLK>,
++				 <&gcc GCC_SYS_NOC_UFS_PHY_AXI_CLK>,
++				 <&gcc GCC_UFS_PHY_AHB_CLK>,
++				 <&gcc GCC_UFS_PHY_UNIPRO_CORE_CLK>,
++				 <&rpmcc RPM_SMD_XO_CLK_SRC>,
++				 <&gcc GCC_UFS_PHY_TX_SYMBOL_0_CLK>,
++				 <&gcc GCC_UFS_PHY_RX_SYMBOL_0_CLK>,
++				 <&gcc GCC_UFS_PHY_ICE_CORE_CLK>;
++			clock-names = "core_clk", "bus_aggr_clk", "iface_clk",
++				      "core_clk_unipro", "ref_clk",
++				      "tx_lane0_sync_clk", "rx_lane0_sync_clk",
++				      "ice_core_clk";
++			freq-table-hz = <50000000 200000000>, <0 0>, <0 0>,
++				<37500000 150000000>, <0 0>, <0 0>, <0 0>,
++				<75000000 300000000>;
++
++			reset-gpios = <&tlmm 156 GPIO_ACTIVE_LOW>;
++			resets = <&gcc GCC_UFS_PHY_BCR>;
++			reset-names = "rst";
++			#reset-cells = <1>;
++
++			phys = <&ufs_mem_phy>;
++			phy-names = "ufsphy";
++			lanes-per-direction = <1>;
++			iommus = <&apps_smmu 0x60 0x0>;
++			status = "okay";
++		};
++
++		ufs_mem_phy: phy@4807000 {
++			compatible = "qcom,sm6125-qmp-ufs-phy";
++			reg = <0x0 0x04807000 0x0 0xddc>;
++			clocks = <&rpmcc RPM_SMD_XO_CLK_SRC>,
++				 <&gcc GCC_UFS_PHY_PHY_AUX_CLK>,
++				 <&gcc GCC_UFS_MEM_CLKREF_CLK>;
++			clock-names = "ref", "ref_aux", "qref";
++			resets = <&ufs_mem_hc 0>;
++			reset-names = "ufsphy";
++			power-domains = <&gcc UFS_PHY_GDSC>;
++			#phy-cells = <0>;
++			status = "okay";
++		};
++
+ 		gpi_dma0: dma-controller@4a00000 {
+ 			compatible = "qcom,sm6375-gpi-dma", "qcom,sm6350-gpi-dma";
+ 			reg = <0 0x04a00000 0 0x60000>;
+@@ -1487,8 +1713,56 @@ usb_1_dwc3: usb@4e00000 {
+ 			};
+ 		};
+ 
++		gpu: gpu@5900000 {
++			compatible = "qcom,adreno-619.1", "qcom,adreno";
++			reg = <0x0 0x05900000 0x0 0x40000>,
++			      <0x0 0x05961000 0x0 0x800>;
++			reg-names = "kgsl_3d0_reg_memory", "cx_dbgc";
++
++			/* A619 on SM6375 uses a GMU wrapper, not GMU firmware. */
++			clocks = <&gpucc GPU_CC_GX_GFX3D_CLK>,
++				 <&gpucc GPU_CC_AHB_CLK>,
++				 <&gcc GCC_GPU_MEMNOC_GFX_CLK>,
++				 <&gcc GCC_GPU_SNOC_DVM_GFX_CLK>,
++				 <&gpucc GPU_CC_CX_GMU_CLK>,
++				 <&gpucc GPU_CC_CXO_CLK>;
++			clock-names = "core", "iface", "mem_iface",
++				      "alt_mem_iface", "gmu", "xo";
++			interrupts = <GIC_SPI 177 IRQ_TYPE_LEVEL_HIGH>;
++			iommus = <&adreno_smmu 0>;
++			power-domains = <&rpmpd SM6375_VDDCX>;
++			operating-points-v2 = <&gpu_opp_table>;
++			qcom,gmu = <&gmu_wrapper>;
++			#cooling-cells = <2>;
++			status = "disabled";
++
++			gpu_zap_shader: zap-shader {
++			};
++
++			gpu_opp_table: opp-table {
++				compatible = "operating-points-v2";
++
++				/* Lowest captured Android OPP, no speed-bin assumptions. */
++				opp-266000000 {
++					opp-hz = /bits/ 64 <266000000>;
++					required-opps = <&rpmpd_opp_low_svs>;
++				};
++			};
++		};
++
++		gmu_wrapper: gmu@596a000 {
++			compatible = "qcom,adreno-gmu-wrapper";
++			reg = <0x0 0x0596a000 0x0 0x30000>;
++			reg-names = "gmu";
++			power-domains = <&gpucc GPU_CX_GDSC>,
++					<&gpucc GPU_GX_GDSC>;
++			power-domain-names = "cx", "gx";
++			status = "disabled";
++		};
++
+ 		adreno_smmu: iommu@5940000 {
+-			compatible = "qcom,sm6375-smmu-v2", "qcom,smmu-v2";
++			compatible = "qcom,sm6375-smmu-v2", "qcom,adreno-smmu",
++				     "qcom,smmu-v2";
+ 			reg = <0 0x05940000 0 0x10000>;
+ 			#iommu-cells = <1>;
+ 			#global-interrupts = <2>;
+diff --git a/arch/arm64/boot/dts/qcom/sm6375-xiaomi-veux.dts b/arch/arm64/boot/dts/qcom/sm6375-xiaomi-veux.dts
+new file mode 100644
+index 000000000..3acde4e59
+--- /dev/null
++++ b/arch/arm64/boot/dts/qcom/sm6375-xiaomi-veux.dts
+@@ -0,0 +1,1018 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Xiaomi Redmi Note 11 Pro 5G (veux): initial USB/netboot bring-up.
++ * Board wiring/carveouts: captured kernel/veux-live.dtb in the port workspace.
++ * SD is enabled for detection tests; internal storage and GPU remain disabled. Display is experimental.
++ */
++/dts-v1/;
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/usb/pd.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#define PMK8350_SID 6
++#include "sm6375.dtsi"
++#include <dt-bindings/soc/qcom,apr.h>
++#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
++#include <dt-bindings/sound/qcom,q6asm.h>
++#include <dt-bindings/clock/qcom,sm6115-lpasscc.h>
++#include <dt-bindings/interconnect/qcom,sm6375-veux.h>
++#include <dt-bindings/interconnect/qcom,sm6375-veux-ipa.h>
++#include "pm6125.dtsi"
++#include "pmk8350.dtsi"
++#include "pmr735a.dtsi"
++
++/* PM6125 owns the power key/reset; avoid duplicate pon labels. */
++/delete-node/ &pmk8350_pon;
++/* The common SoC tree describes a different firmware carveout layout. */
++/delete-node/ &pil_cdsp_mem;
++/delete-node/ &pil_video_mem;
++/delete-node/ &pil_ipa_fw_mem;
++/delete-node/ &pil_ipa_gsi_mem;
++/delete-node/ &pil_gpu_micro_code_mem;
++
++/ {
++	model = "Xiaomi Redmi Note 11 Pro 5G";
++	compatible = "xiaomi,veux", "qcom,sm6375";
++	chassis-type = "handset";
++
++	gpio-keys {
++		compatible = "gpio-keys";
++		pinctrl-names = "default";
++		pinctrl-0 = <&volume_up_default>;
++
++		key-volume-up {
++			label = "Volume Up";
++			linux,code = <KEY_VOLUMEUP>;
++			gpios = <&pmr735a_gpios 1 GPIO_ACTIVE_LOW>;
++			debounce-interval = <15>;
++			wakeup-source;
++		};
++	};
++
++	touch_dvdd: regulator-touch-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "touch-dvdd";
++		gpio = <&tlmm 44 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <3000>;
++	};
++
++	touch_avdd: regulator-touch-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "touch-avdd";
++		gpio = <&tlmm 51 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <700>;
++	};
++
++	cam_main_vdig: regulator-camera-main-vdig {
++		compatible = "regulator-fixed";
++		regulator-name = "camera-main-vdig";
++		regulator-min-microvolt = <1050000>;
++		regulator-max-microvolt = <1050000>;
++		gpio = <&tlmm 58 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <135>;
++		vin-supply = <&pm6125_s6>;
++	};
++
++	/*
++	 * Stock firmware and the captured stock FDT do not expose an amp rail
++	 * switch; both amplifiers were already responsive on the live board.
++	 * Model that externally powered rail as fixed and always on. This node
++	 * has no GPIO or PMIC handle and therefore never toggles board power.
++	 */
++	aw88261_dvdd: regulator-aw88261-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "aw88261-dvdd-unmanaged";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		regulator-boot-on;
++		regulator-always-on;
++	};
++
++	/* Diagnostic handoff only; no panel driver or display modesetting. */
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		framebuffer@85200000 {
++			compatible = "simple-framebuffer";
++			status = "disabled";
++			reg = <0 0x85200000 0 0xc00000>;
++			width = <1080>;
++			height = <2400>;
++			/* Firmware pitch/format still require hardware verification. */
++			stride = <(1080 * 4)>;
++			format = "a8r8g8b8";
++			clocks = <&gcc GCC_DISP_AHB_CLK>,
++				 <&gcc GCC_DISP_HF_AXI_CLK>,
++				 <&gcc GCC_DISP_THROTTLE_CORE_CLK>,
++				 <&gcc GCC_DISP_GPLL0_DIV_CLK_SRC>;
++		};
++	};
++
++	reserved-memory {
++		cont_splash_mem: framebuffer@85200000 {
++			reg = <0 0x85200000 0 0xc00000>;
++			no-map;
++		};
++		pil_cdsp_mem: pil-cdsp@89300000 {
++			reg = <0 0x89300000 0 0x1e00000>;
++			no-map;
++		};
++		pil_video_mem: pil-video@8b100000 {
++			reg = <0 0x8b100000 0 0x500000>;
++			no-map;
++		};
++		pil_ipa_fw_mem: pil-ipa-fw@8b600000 {
++			reg = <0 0x8b600000 0 0x10000>;
++			no-map;
++		};
++		pil_ipa_gsi_mem: pil-ipa-gsi@8b610000 {
++			reg = <0 0x8b610000 0 0xa000>;
++			no-map;
++		};
++		pil_gpu_micro_code_mem: pil-gpu-ucode@8b61a000 {
++			reg = <0 0x8b61a000 0 0x2000>;
++			no-map;
++		};
++		ramoops@d0000000 {
++			compatible = "ramoops";
++			reg = <0 0xd0000000 0 0x200000>;
++			record-size = <0x100000>;
++			/* Keep the first 1 MiB panic record compatible with recovery. */
++			console-size = <0x80000>;
++			pmsg-size = <0x80000>;
++			ecc-size = <16>;
++			max-reason = <4>;
++		};
++	};
++};
++
++&pil_adsp_mem {
++	reg = <0 0x86700000 0 0x2c00000>;
++};
++
++&pon_pwrkey {
++	status = "okay";
++};
++
++&pon_resin {
++	linux,code = <KEY_VOLUMEDOWN>;
++	status = "okay";
++};
++
++&rpm_requests {
++	regulators-0 {
++		compatible = "qcom,rpm-pm6125-regulators";
++		/* Stock camera VDIG is fed from the PM6125 S6 rail. */
++		pm6125_s6: s6 {
++			regulator-min-microvolt = <1352000>;
++			regulator-max-microvolt = <1374000>;
++		};
++		pm6125_l2: l2 {
++			regulator-min-microvolt = <1170000>;
++			regulator-max-microvolt = <1304000>;
++		};
++		pm6125_l16: l16 {
++			regulator-min-microvolt = <1620000>;
++			regulator-max-microvolt = <1980000>;
++		};
++		pm6125_l21: l21 {
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3312000>;
++		};
++		pm6125_l23: l23 {
++			regulator-min-microvolt = <3000000>;
++			regulator-max-microvolt = <3312000>;
++		};
++		/* Initial SD test uses 2.96 V I/O, without UHS voltage switching. */
++		pm6125_l4: l4 {
++			regulator-min-microvolt = <1200000>;
++			regulator-max-microvolt = <1200000>;
++		};
++		pm6125_l5: l5 {
++			regulator-min-microvolt = <2960000>;
++			regulator-max-microvolt = <2960000>;
++		};
++		pm6125_l22: l22 {
++			regulator-min-microvolt = <2960000>;
++			regulator-max-microvolt = <2960000>;
++		};
++		pm6125_l7: l7 {
++			regulator-min-microvolt = <880000>;
++			regulator-max-microvolt = <880000>;
++		};
++		pm6125_l9: l9 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++		pm6125_l14: l14 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++		pm6125_l10: l10 {
++			regulator-min-microvolt = <1800000>;
++			regulator-max-microvolt = <1800000>;
++		};
++	};
++	regulators-1 {
++		compatible = "qcom,rpm-pmr735a-regulators";
++		pmr735a_l2: l2 {
++			regulator-min-microvolt = <640000>;
++			regulator-max-microvolt = <640000>;
++		};
++		pmr735a_l7: l7 {
++			regulator-min-microvolt = <3080000>;
++			regulator-max-microvolt = <3080000>;
++		};
++	};
++};
++
++&usb_1 {
++	status = "okay";
++};
++
++&usb_1_dwc3 {
++	dr_mode = "peripheral";
++};
++
++&usb_1_hsphy {
++	vdda-pll-supply = <&pm6125_l7>;
++	vdda18-supply = <&pm6125_l10>;
++	vdda33-supply = <&pmr735a_l7>;
++	/* Stock overrides: 0xc7 at 0x6c, 0xcc at 0x70, 0x2e at 0x74.
++	 * Translate through phy-qcom-snps-femto-v2.c's 7nm parameter tables.
++	 */
++	qcom,hs-disconnect-bp = <2156>;
++	qcom,squelch-detector-bp = <(-1560)>;
++	qcom,hs-amplitude-bp = <2000>;
++	qcom,pre-emphasis-duration-bp = <20000>;
++	qcom,pre-emphasis-amplitude-bp = <30000>;
++	qcom,hs-rise-fall-time-bp = <0>;
++	qcom,hs-crossover-voltage-microvolt = <0>;
++	qcom,hs-output-impedance-micro-ohms = <2600000>;
++	status = "okay";
++};
++
++&xo_board_clk {
++	clock-frequency = <19200000>;
++};
++
++/* Battery gauge wrapper; other serial engines remain disabled. */
++&gpi_dma0 {
++	status = "okay";
++};
++
++&qupv3_id_0 {
++	status = "okay";
++};
++
++/* Only the touchscreen serial engine in this wrapper is enabled. */
++&gpi_dma1 {
++	status = "okay";
++};
++
++&qupv3_id_1 {
++	status = "okay";
++};
++
++/* SDCC2 wiring from the captured Android FDT. NBD remains the rootfs. */
++&sdhc_2 {
++	vmmc-supply = <&pm6125_l22>;
++	vqmmc-supply = <&pm6125_l5>;
++	no-mmc;
++	no-sdio;
++	no-1-8-v;
++	max-frequency = <25000000>;
++	cd-gpios = <&tlmm 94 GPIO_ACTIVE_HIGH>;
++	disable-wp;
++	status = "okay";
++};
++
++&tlmm {
++	compatible = "xiaomi,veux-tlmm", "qcom,sm6375-tlmm";
++	/* Keep firmware-reserved GPIOs hidden except the stock camera slot-0
++	 * controls GPIO58 (VDIG) and GPIO93 (VIO/standby).
++	 */
++	gpio-reserved-ranges = <13 4>, <45 6>, <52 6>, <59 24>, <84 9>,
++			       <95 5>, <101 55>;
++
++	typec_int_default: typec-int-default-state {
++		pins = "gpio100";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	gt9896_ts_active: gt9896-ts-active-state {
++		pins = "gpio21", "gpio22";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-pull-up;
++	};
++
++	gt9896_ts_power_active: gt9896-ts-power-active-state {
++		pins = "gpio44", "gpio51";
++		function = "gpio";
++		drive-strength = <8>;
++		bias-disable;
++	};
++
++	cci0_default: cci0-default-state {
++		cci0_i2c0_default: cci0-i2c0-default-pins {
++			pins = "gpio39", "gpio40";
++			function = "cci_i2c";
++			drive-strength = <2>;
++			bias-pull-up;
++		};
++	};
++
++	cci0_gpio_probe: cci0-gpio-probe-state {
++		cci0_i2c0_gpio_probe: cci0-i2c0-gpio-probe-pins {
++			pins = "gpio39", "gpio40";
++			function = "gpio";
++			drive-strength = <2>;
++			bias-pull-up;
++			input-enable;
++		};
++	};
++
++	cci0_gpio_high: cci0-gpio-high-state {
++		veux_cci0_i2c0_gpio_high: cci0-i2c0-gpio-high-pins {
++			pins = "gpio39", "gpio40";
++			function = "gpio";
++			drive-strength = <2>;
++			bias-pull-up;
++			output-high;
++		};
++	};
++
++	cci0_sleep: cci0-sleep-state {
++		cci0_i2c0_sleep: cci0-i2c0-sleep-pins {
++			pins = "gpio39", "gpio40";
++			function = "cci_i2c";
++			drive-strength = <2>;
++			bias-pull-down;
++		};
++	};
++
++	veux_cam_mclk0_active: veux-camera-mclk0-active-state {
++		pins = "gpio29";
++		function = "cam_mclk";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	veux_cam_mclk0_sleep: veux-camera-mclk0-sleep-state {
++		pins = "gpio29";
++		function = "cam_mclk";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	veux_cam_reset0_active: veux-camera-reset0-active-state {
++		pins = "gpio34";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	veux_cam_reset0_sleep: veux-camera-reset0-sleep-state {
++		pins = "gpio34";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++		output-low;
++	};
++};
++
++/* First DRM probe: bootloader retains panel power and TLMM47 enable.
++ * PMR735A GPIO2 exists in mainline, but reset is intentionally left alone
++ * until a powered-panel takeover has been tested. No TE/ESD GPIO requests.
++ */
++&dispcc {
++	status = "okay";
++};
++
++&mdss {
++	status = "okay";
++};
++
++&mdss_dsi0 {
++	vdda-supply = <&pm6125_l4>;
++	refgen-supply = <&refgen>;
++	status = "okay";
++
++	panel@0 {
++		compatible = "xiaomi,k6s-38-0c-0a";
++		reg = <0>;
++		status = "okay";
++
++		port {
++			panel_in: endpoint {
++				remote-endpoint = <&dsi0_out>;
++			};
++		};
++	};
++};
++
++&dsi0_out {
++	remote-endpoint = <&panel_in>;
++};
++
++&mdss_dsi0_phy {
++	status = "okay";
++};
++
++&mdss_mdp {
++	interconnects = <&holi_display_icc VEUX_MASTER_MDP0
++			 &holi_display_icc VEUX_SLAVE_EBI>;
++	interconnect-names = "mdp0-mem";
++};
++
++&soc {
++	holi_display_icc: interconnect-veux-display {
++		compatible = "qcom,sm6375-holi-display-icc";
++		#interconnect-cells = <1>;
++	};
++};
++
++/* Captured Android gauge: QUP SE0, GPIO0/1, address 0x55. */
++&i2c0 {
++	status = "okay";
++	clock-frequency = <100000>;
++
++	battery_gauge: battery@55 {
++		compatible = "ti,bq27z561";
++		reg = <0x55>;
++	};
++
++	haptic@5a {
++		compatible = "xiaomi,veux-aw8624";
++		reg = <0x5a>;
++		reset-gpios = <&tlmm 2 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&aw8624_reset_default>;
++	};
++};
++
++/* Captured mux matches the Blair-derived pinctrl table on GPIO4/5. */
++&qup_i2c10_default {
++	function = "qup14";
++};
++
++/* Captured primary charger; poll instead of exposing charger IRQ GPIO99. */
++&i2c10 {
++	status = "okay";
++	clock-frequency = <100000>;
++
++	/* HUSB311 identified on hardware; driver remains modular. */
++	usb-c-controller@4e {
++		compatible = "hynetek,husb311", "richtek,rt1711h";
++		reg = <0x4e>;
++		interrupt-parent = <&tlmm>;
++		interrupts = <100 IRQ_TYPE_LEVEL_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&typec_int_default>;
++
++		connector {
++			compatible = "usb-c-connector";
++			label = "USB-C";
++			power-role = "sink";
++			data-role = "device";
++			sink-pdos = <PDO_FIXED(5000, 2000, 0)>;
++			op-sink-microwatt = <10000000>;
++		};
++	};
++
++	charger@6a {
++		compatible = "xiaomi,veux-syv690";
++		reg = <0x6a>;
++		xiaomi,battery-gauge = <&battery_gauge>;
++	};
++
++	/* Stock board IDs 0x2113 identify the two speaker AW88261 devices. */
++	aw88261_l: audio-codec@34 {
++		compatible = "awinic,aw88261";
++		reg = <0x34>;
++		dvdd-supply = <&aw88261_dvdd>;
++		firmware-name = "qcom/xiaomi/veux/aw882xx_pid_2113_acf.bin";
++		awinic,audio-channel = <0>;
++		sound-name-prefix = "Amplifier L";
++		#sound-dai-cells = <0>;
++	};
++
++	aw88261_r: audio-codec@35 {
++		compatible = "awinic,aw88261";
++		reg = <0x35>;
++		dvdd-supply = <&aw88261_dvdd>;
++		firmware-name = "qcom/xiaomi/veux/aw882xx_pid_2113_acf.bin";
++		awinic,audio-channel = <1>;
++		sound-name-prefix = "Amplifier R";
++		#sound-dai-cells = <0>;
++	};
++};
++
++/* Wiring and coordinate range from the captured working Android FDT. */
++&i2c8 {
++	status = "okay";
++
++	touchscreen@5d {
++		compatible = "goodix,gt9896";
++		reg = <0x5d>;
++		interrupt-parent = <&tlmm>;
++		interrupts = <22 IRQ_TYPE_EDGE_FALLING>;
++		reset-gpios = <&tlmm 21 GPIO_ACTIVE_LOW>;
++		vddio-supply = <&touch_dvdd>;
++		avdd-supply = <&touch_avdd>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&gt9896_ts_active &gt9896_ts_power_active>;
++		touchscreen-size-x = <8640>;
++		touchscreen-size-y = <19200>;
++	};
++};
++
++/* First GPU test: low OPP, captured signed zap carveout, no storage changes. */
++&gpu {
++	status = "okay";
++};
++
++&gmu_wrapper {
++	status = "okay";
++};
++
++&gpu_zap_shader {
++	memory-region = <&pil_gpu_micro_code_mem>;
++	firmware-name = "qcom/xiaomi/veux/a615_zap.mdt";
++};
++
++/* Stock firmware and its RMTS allocation request require 3 MiB. */
++&rmtfs_mem {
++	reg = <0 0xf3900000 0 0x300000>;
++};
++
++/* MPSS provides the WLAN QMI service. Its upstream auto_boot stays false. */
++&remoteproc_mss {
++	firmware-name = "qcom/xiaomi/veux/modem.mdt";
++	status = "okay";
++};
++
++&wifi {
++	vdd-0.8-cx-mx-supply = <&pmr735a_l2>;
++	vdd-1.8-xo-supply = <&pm6125_l16>;
++	vdd-1.3-rfa-supply = <&pm6125_l2>;
++	vdd-3.3-ch0-supply = <&pm6125_l23>;
++	vdd-3.3-ch1-supply = <&pm6125_l21>;
++	status = "okay";
++};
++
++/* Stock AW8624 reset; GPIO2 is already exposed by the verified GPIO mask. */
++&tlmm {
++	aw8624_reset_default: aw8624-reset-default-state {
++		pins = "gpio2";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-disable;
++	};
++};
++
++/* IPA path added to the boot-tested display/touch/GPU baseline. */
++&soc {
++	ipa_modem_tables: modem-tables@c123000 {
++		reg = <0 0x0c123000 0 0x2000>;
++	};
++
++	ipa: ipa@5840000 {
++		compatible = "qcom,sm6375-ipa";
++
++		iommus = <&apps_smmu 0x4a0 0x0>,
++			 <&apps_smmu 0x4a2 0x0>;
++		reg = <0 0x05840000 0 0x8000>,
++		      <0 0x05850000 0 0x4ad0>,
++		      <0 0x05804000 0 0x23000>;
++		reg-names = "ipa-reg", "ipa-shared", "gsi";
++
++		interrupts-extended = <&intc GIC_SPI 257 IRQ_TYPE_LEVEL_HIGH>,
++				      <&intc GIC_SPI 259 IRQ_TYPE_LEVEL_HIGH>,
++				      <&ipa_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
++				      <&ipa_smp2p_in 1 IRQ_TYPE_EDGE_RISING>;
++		interrupt-names = "ipa", "gsi",
++				   "ipa-clock-query", "ipa-setup-ready";
++
++		clocks = <&rpmcc RPM_SMD_IPA_CLK>;
++		clock-names = "core";
++
++		interconnects = <&holi_display_icc VEUX_IPA_MASTER
++				 &holi_display_icc VEUX_SLAVE_EBI>,
++				<&holi_display_icc VEUX_IPA_MASTER
++				 &holi_display_icc VEUX_IPA_OCIMEM>,
++				<&holi_display_icc VEUX_IPA_APPS
++				 &holi_display_icc VEUX_IPA_CFG>;
++		interconnect-names = "memory", "imem", "config";
++
++		qcom,smem-states = <&ipa_smp2p_out 0>, <&ipa_smp2p_out 1>;
++		qcom,smem-state-names = "ipa-clock-enabled-valid",
++					"ipa-clock-enabled";
++
++		qcom,gsi-loader = "self";
++		memory-region = <&pil_ipa_fw_mem>;
++		firmware-name = "qcom/xiaomi/veux/ipa_fws.mdt";
++		sram = <&ipa_modem_tables>;
++		status = "okay";
++	};
++};
++
++/* First audio stage: explicit DSP startup, without codec/pin programming. */
++&remoteproc_adsp {
++	firmware-name = "qcom/xiaomi/veux/adsp.mdt";
++	status = "okay";
++
++	glink-edge {
++		apr {
++			compatible = "qcom,apr-v2";
++			qcom,glink-channels = "apr_audio_svc";
++			qcom,domain = <APR_DOMAIN_ADSP>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			service@3 {
++				compatible = "qcom,q6core";
++				reg = <APR_SVC_ADSP_CORE>;
++				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++			};
++
++			q6asm: service@7 {
++				compatible = "qcom,q6asm";
++				reg = <APR_SVC_ASM>;
++				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++
++				q6asmdai: dais {
++					compatible = "qcom,q6asm-dais";
++					#address-cells = <1>;
++					#size-cells = <0>;
++					#sound-dai-cells = <1>;
++					iommus = <&apps_smmu 0xa1 0>;
++
++					dai@0 {
++						reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
++					};
++				};
++			};
++
++			q6adm: service@8 {
++				compatible = "qcom,q6adm";
++				reg = <APR_SVC_ADM>;
++				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++
++				q6routing: routing {
++					compatible = "qcom,q6adm-routing";
++					#sound-dai-cells = <0>;
++				};
++			};
++
++			q6afe: service@4 {
++				compatible = "qcom,q6afe";
++				reg = <APR_SVC_AFE>;
++				qcom,protection-domain = "avs/audio", "msm/adsp/audio_pd";
++
++				q6afedai: dais {
++					compatible = "qcom,q6afe-dais";
++					#address-cells = <1>;
++					#size-cells = <0>;
++					#sound-dai-cells = <1>;
++
++					dai@128 {
++						reg = <SECONDARY_MI2S_RX>;
++						qcom,sd-lines = <0>;
++					};
++				};
++
++				q6afecc: clock-controller {
++					compatible = "qcom,q6afe-clocks";
++					#clock-cells = <2>;
++				};
++			};
++
++
++		};
++	};
++};
++
++&pmr735a_gpios {
++	volume_up_default: volume-up-default-state {
++		pins = "gpio1";
++		function = "normal";
++		power-source = <1>;
++		bias-pull-up;
++		input-enable;
++	};
++};
++
++/* Load the VA driver explicitly after ADSP/Q6AFE is running. */
++&soc {
++	vamacro: codec@a730000 {
++		compatible = "qcom,sm6115-lpass-va-macro";
++		reg = <0 0x0a730000 0 0x1000>;
++		clocks = <&q6afecc LPASS_CLK_ID_VA_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&q6afecc LPASS_CLK_ID_VA_CORE_2X_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		clock-names = "mclk", "dcodec", "npl";
++		#clock-cells = <0>;
++		#sound-dai-cells = <1>;
++		clock-output-names = "fsgen";
++		qcom,dmic-sample-rate = <600000>;
++	};
++};
++
++/* All new audio consumers below are modules, loaded explicitly for tests. */
++/ {
++	wcd9370: audio-codec {
++		compatible = "qcom,wcd9370-codec";
++		pinctrl-names = "default";
++		pinctrl-0 = <&wcd_reset_default>;
++		reset-gpios = <&tlmm 83 GPIO_ACTIVE_LOW>;
++		vdd-rxtx-supply = <&pm6125_l9>;
++		vdd-px-supply = <&pm6125_l9>;
++		vdd-buck-supply = <&pm6125_l14>;
++		qcom,micbias1-microvolt = <2400000>;
++		qcom,micbias2-microvolt = <2400000>;
++		qcom,micbias3-microvolt = <2400000>;
++		qcom,micbias4-microvolt = <2400000>;
++		qcom,rx-device = <&wcd_rx>;
++		qcom,tx-device = <&wcd_tx>;
++		#sound-dai-cells = <1>;
++	};
++
++	sound {
++		compatible = "xiaomi,veux-sndcard";
++		model = "Xiaomi veux";
++		pinctrl-names = "default";
++		pinctrl-0 = <&i2s2_speaker_active>;
++		audio-routing = "AMIC1", "MIC BIAS1",
++				"AMIC3", "MIC BIAS3",
++				"TX SWR_INPUT0", "ADC1_OUTPUT",
++				"TX SWR_INPUT4", "ADC2_OUTPUT";
++
++		mm1-dai-link {
++			link-name = "MultiMedia1";
++			cpu { sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>; };
++		};
++
++		speaker-playback-dai-link {
++			link-name = "Secondary MI2S Speaker Playback";
++			cpu { sound-dai = <&q6afedai SECONDARY_MI2S_RX>; };
++			codec { sound-dai = <&aw88261_l>, <&aw88261_r>; };
++			platform { sound-dai = <&q6routing>; };
++		};
++
++		wcd-capture-dai-link {
++			link-name = "WCD Capture";
++			cpu { sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>; };
++			codec { sound-dai = <&wcd9370 1>, <&swr_tx 0>, <&txmacro 0>; };
++			platform { sound-dai = <&q6routing>; };
++		};
++	};
++};
++
++&tlmm {
++	wcd_reset_default: wcd-reset-default-state {
++		pins = "gpio83";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-disable;
++	};
++};
++
++&soc {
++	lpass_tlmm: pinctrl@a7c0000 {
++		compatible = "qcom,sm6115-lpass-lpi-pinctrl";
++		reg = <0 0x0a7c0000 0 0x20000>, <0 0x0a950000 0 0x10000>;
++		clocks = <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++		clock-names = "audio";
++		gpio-controller;
++		#gpio-cells = <2>;
++		gpio-ranges = <&lpass_tlmm 0 0 19>;
++
++		i2s2_speaker_active: i2s2-speaker-active-state {
++			clk-pins {
++				pins = "gpio10";
++				function = "i2s2_clk";
++				drive-strength = <8>;
++				bias-disable;
++			};
++			ws-pins {
++				pins = "gpio11";
++				function = "i2s2_ws";
++				drive-strength = <8>;
++				bias-disable;
++			};
++			data-pins {
++				pins = "gpio12", "gpio13";
++				function = "i2s2_data";
++				drive-strength = <8>;
++				bias-disable;
++			};
++		};
++
++		swr_tx_default: swr-tx-default-state {
++			clk-pins {
++				pins = "gpio0";
++				function = "swr_tx_clk";
++				drive-strength = <10>;
++				slew-rate = <1>;
++				bias-disable;
++			};
++			data-pins {
++				pins = "gpio1", "gpio2";
++				function = "swr_tx_data";
++				drive-strength = <10>;
++				slew-rate = <1>;
++				bias-bus-hold;
++			};
++		};
++
++		swr_rx_default: swr-rx-default-state {
++			clk-pins {
++				pins = "gpio3";
++				function = "swr_rx_clk";
++				drive-strength = <10>;
++				slew-rate = <1>;
++				bias-disable;
++			};
++			data-pins {
++				pins = "gpio4", "gpio5";
++				function = "swr_rx_data";
++				drive-strength = <10>;
++				slew-rate = <1>;
++				bias-bus-hold;
++			};
++		};
++	};
++
++	lpass_audiocc: clock-controller@a6a9000 {
++		compatible = "qcom,sm6115-lpassaudiocc";
++		reg = <0 0x0a6a9000 0 0x1000>;
++		#clock-cells = <1>;
++		#reset-cells = <1>;
++	};
++
++	lpasscc: clock-controller@a7ec000 {
++		compatible = "qcom,sm6115-lpasscc";
++		reg = <0 0x0a7ec000 0 0x1000>;
++		#clock-cells = <1>;
++		#reset-cells = <1>;
++	};
++
++	rxmacro: codec@a600000 {
++		compatible = "qcom,sm6115-lpass-rx-macro";
++		reg = <0 0x0a600000 0 0x1000>;
++		clocks = <&q6afecc LPASS_CLK_ID_RX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&q6afecc LPASS_CLK_ID_RX_CORE_NPL_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&vamacro>;
++		clock-names = "mclk", "npl", "dcodec", "fsgen";
++		#clock-cells = <0>;
++		#sound-dai-cells = <1>;
++	};
++
++	txmacro: codec@a620000 {
++		compatible = "qcom,sm6115-lpass-tx-macro";
++		reg = <0 0x0a620000 0 0x1000>;
++		clocks = <&q6afecc LPASS_CLK_ID_TX_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&q6afecc LPASS_CLK_ID_TX_CORE_NPL_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++			 <&vamacro>;
++		clock-names = "mclk", "npl", "dcodec", "fsgen";
++		#clock-cells = <0>;
++		#sound-dai-cells = <1>;
++	};
++
++	swr_tx: soundwire@a740000 {
++		compatible = "qcom,soundwire-v1.6.0";
++		reg = <0 0x0a740000 0 0x2000>;
++		interrupts-extended = <&mpm 5 IRQ_TYPE_EDGE_RISING>;
++		interrupt-names = "core";
++		clocks = <&vamacro>;
++		clock-names = "iface";
++		resets = <&lpasscc LPASS_SWR_TX_CONFIG_CGCR>;
++		reset-names = "swr_audio_cgcr";
++		pinctrl-names = "default";
++		pinctrl-0 = <&swr_tx_default>;
++		qcom,ports-sinterval-low = /bits/ 8 <3 3 3 0>;
++		qcom,ports-offset1 = /bits/ 8 <0 1 2 0>;
++		qcom,ports-offset2 = /bits/ 8 <0 0 0 0>;
++		qcom,ports-block-pack-mode = /bits/ 8 <0xff 0xff 0xff 0xff>;
++		qcom,ports-lane-control = /bits/ 8 <1 0 0 0>;
++		#sound-dai-cells = <1>;
++		#address-cells = <2>;
++		#size-cells = <0>;
++
++		wcd_tx: codec@0,3 {
++			compatible = "sdw20217010a00";
++			reg = <0 3>;
++			qcom,tx-port-mapping = <1 2 3 3>;
++			qcom,tx-channel-mapping = /bits/ 8 <1 1 2 4 1 2 3 4 1 2 3 4>;
++		};
++	};
++
++	swr_rx: soundwire@a610000 {
++		compatible = "qcom,soundwire-v1.6.0";
++		/* The board uses all six outputs; its hardware input is unused. */
++		qcom,din-ports = <0>;
++		reg = <0 0x0a610000 0 0x2000>;
++		interrupts = <GIC_SPI 297 IRQ_TYPE_EDGE_RISING>;
++		interrupt-names = "core";
++		clocks = <&rxmacro>;
++		clock-names = "iface";
++		resets = <&lpass_audiocc LPASS_AUDIO_SWR_RX_CGCR>;
++		reset-names = "swr_audio_cgcr";
++		pinctrl-names = "default";
++		pinctrl-0 = <&swr_rx_default>;
++		qcom,ports-sinterval = /bits/ 16 <3 31 31 7 0 399>;
++		qcom,ports-offset1 = /bits/ 8 <0 0 11 1 0 0>;
++		qcom,ports-offset2 = /bits/ 8 <0 0 11 0 0 0>;
++		qcom,ports-word-length = /bits/ 8 <1 7 4 0xff 0xff 15>;
++		qcom,ports-block-pack-mode = /bits/ 8 <0xff 0 1 0xff 0 0>;
++		qcom,ports-lane-control = /bits/ 8 <1 0 0 0 0 0>;
++		qcom,ports-hstart = /bits/ 8 <0xff 3 0xff 0xff 0xff 8>;
++		qcom,ports-hstop = /bits/ 8 <0xff 6 0xff 0xff 0xff 8>;
++		#sound-dai-cells = <1>;
++		#address-cells = <2>;
++		#size-cells = <0>;
++
++		wcd_rx: codec@0,4 {
++			compatible = "sdw20217010a00";
++			reg = <0 4>;
++			qcom,rx-port-mapping = <1 2 3 4 5>;
++			qcom,rx-channel-mapping = /bits/ 8 <1 2 1 1 2 1 1 2>;
++		};
++	};
++};
++
++&soc {
++	/* Expose CSIPHY0/CSID0/TFE0 to V4L2.
++	 * Keep sensor nodes disabled until power and pin ownership are verified.
++	 * No ICC paths are requested, so do not stream.
++	 */
++	camss: camss@5c52000 {
++		compatible = "qcom,sm6375-camss";
++		reg = <0 0x05c52000 0 0x2000>,
++		      <0 0x05c6e000 0 0x1000>,
++		      <0 0x05c6f000 0 0x4000>;
++		reg-names = "csiphy0", "csid0", "vfe0";
++		interrupts = <GIC_SPI 72 IRQ_TYPE_EDGE_RISING>,
++			     <GIC_SPI 210 IRQ_TYPE_EDGE_RISING>,
++			     <GIC_SPI 211 IRQ_TYPE_EDGE_RISING>;
++		interrupt-names = "csiphy0", "csid0", "vfe0";
++		clocks = <&gcc GCC_CAMSS_TOP_AHB_CLK>,
++			 <&gcc GCC_CAMERA_AHB_CLK>,
++			 <&gcc GCC_CAMSS_AXI_CLK>,
++			 <&gcc GCC_CAMSS_TFE_0_CSID_CLK>,
++			 <&gcc GCC_CAMSS_CPHY_0_CLK>,
++			 <&gcc GCC_CAMSS_CSI0PHYTIMER_CLK>,
++			 <&gcc GCC_CAMSS_TFE_0_CLK>,
++			 <&gcc GCC_CAMSS_TFE_0_CPHY_RX_CLK>,
++			 <&gcc GCC_CAMSS_NRT_AXI_CLK>,
++			 <&gcc GCC_CAMSS_RT_AXI_CLK>;
++		clock-names = "top_ahb", "ahb", "axi", "csi0", "csiphy0",
++			      "csiphy0_timer", "vfe0", "vfe0_cphy_rx",
++			      "camnoc_nrt_axi", "camnoc_rt_axi";
++		iommus = <&apps_smmu 0x800 0x400>;
++		power-domains = <&gcc CAMSS_TOP_GDSC>;
++		mipi-csi-vdd1-supply = <&pm6125_l7>;
++		mipi-csi-vdd2-supply = <&pm6125_l4>;
++		status = "okay";
++	};
++};
++
++&cci {
++	/* Probe the controller and register empty I2C adapters; no clients exist. */
++	qcom,tlmm = <&tlmm>;
++	pinctrl-names = "default", "sleep", "gpio-probe", "gpio-high";
++	pinctrl-0 = <&cci0_i2c0_default>;
++	pinctrl-1 = <&cci0_i2c0_sleep>;
++	pinctrl-2 = <&cci0_i2c0_gpio_probe>;
++	pinctrl-3 = <&veux_cci0_i2c0_gpio_high>;
++	status = "okay";
++};
++
++&cci_i2c0 {
++	/* One-shot identity probe only; no mode tables or CSI streaming. */
++	s5khm2_id_probe: camera@10 {
++		compatible = "xiaomi,veux-s5khm2-id-probe";
++		reg = <0x10>;
++		/* Android's cam_clk supply enables this GDSC before MCLK. */
++		power-domains = <&gcc CAMSS_TOP_GDSC>;
++		clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
++		clock-names = "xclk";
++		vdig-supply = <&cam_main_vdig>;
++		reset-gpios = <&tlmm 34 GPIO_ACTIVE_LOW>;
++		vana-gpios = <&tlmm 43 GPIO_ACTIVE_HIGH>;
++		vio-gpios = <&tlmm 93 GPIO_ACTIVE_HIGH>;
++		pinctrl-names = "default", "sleep";
++		pinctrl-0 = <&veux_cam_mclk0_active &veux_cam_reset0_active>;
++		pinctrl-1 = <&veux_cam_mclk0_sleep &veux_cam_reset0_sleep>;
++	};
++};
+diff --git a/arch/arm64/configs/veux_netboot_defconfig b/arch/arm64/configs/veux_netboot_defconfig
+new file mode 100644
+index 000000000..3ff9f17c4
+--- /dev/null
++++ b/arch/arm64/configs/veux_netboot_defconfig
+@@ -0,0 +1,278 @@
++CONFIG_LOCALVERSION="-veux-mainline"
++# CONFIG_LOCALVERSION_AUTO is not set
++CONFIG_SYSVIPC=y
++CONFIG_POSIX_MQUEUE=y
++CONFIG_NO_HZ_IDLE=y
++CONFIG_HIGH_RES_TIMERS=y
++CONFIG_PREEMPT_LAZY=y
++CONFIG_IKCONFIG=y
++CONFIG_IKCONFIG_PROC=y
++CONFIG_LOG_BUF_SHIFT=20
++CONFIG_CGROUPS=y
++CONFIG_MEMCG=y
++CONFIG_BLK_CGROUP=y
++CONFIG_CGROUP_PIDS=y
++CONFIG_CGROUP_FREEZER=y
++CONFIG_CPUSETS=y
++CONFIG_CGROUP_DEVICE=y
++CONFIG_CGROUP_CPUACCT=y
++CONFIG_NAMESPACES=y
++CONFIG_USER_NS=y
++CONFIG_BLK_DEV_INITRD=y
++CONFIG_RD_GZIP=y
++CONFIG_RD_LZ4=y
++CONFIG_KALLSYMS=y
++CONFIG_EXPERT=y
++CONFIG_CHECKPOINT_RESTORE=y
++CONFIG_BPF_SYSCALL=y
++CONFIG_ARCH_QCOM=y
++CONFIG_NR_CPUS=8
++# CONFIG_RANDOMIZE_BASE is not set
++# CONFIG_CPU_IDLE is not set
++CONFIG_CPU_FREQ=y
++CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y
++CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y
++CONFIG_ARM_QCOM_CPUFREQ_HW=y
++# CONFIG_SUSPEND is not set
++CONFIG_PM=y
++CONFIG_PM_OPP=y
++CONFIG_THERMAL=y
++CONFIG_CPU_THERMAL=y
++CONFIG_CPU_FREQ_THERMAL=y
++CONFIG_QCOM_TSENS=y
++CONFIG_NVMEM_QCOM_QFPROM=y
++CONFIG_MODULES=y
++CONFIG_MODULE_UNLOAD=y
++CONFIG_BINFMT_ELF=y
++CONFIG_BINFMT_SCRIPT=y
++CONFIG_SWAP=y
++CONFIG_ZRAM=y
++CONFIG_ZRAM_BACKEND_ZSTD=y
++CONFIG_ZRAM_DEF_COMP_ZSTD=y
++CONFIG_NET=y
++CONFIG_PACKET=y
++CONFIG_UNIX=y
++CONFIG_INET=y
++CONFIG_IPV6=y
++CONFIG_NETFILTER=y
++CONFIG_NETFILTER_ADVANCED=y
++CONFIG_NF_TABLES=y
++CONFIG_NF_CONNTRACK=y
++CONFIG_NFT_CT=y
++CONFIG_NFT_REJECT=y
++CONFIG_NF_NAT=y
++CONFIG_NFT_MASQ=y
++CONFIG_NETDEVICES=y
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_FW_LOADER=y
++CONFIG_BLK_DEV_LOOP=y
++CONFIG_BLK_DEV_LOOP_MIN_COUNT=8
++CONFIG_INPUT=y
++CONFIG_INPUT_EVDEV=y
++CONFIG_INPUT_MISC=y
++CONFIG_INPUT_PM8941_PWRKEY=y
++CONFIG_TTY=y
++CONFIG_UNIX98_PTYS=y
++CONFIG_SERIAL_EARLYCON=y
++CONFIG_SERIAL_QCOM_GENI=y
++CONFIG_SERIAL_QCOM_GENI_CONSOLE=y
++CONFIG_HW_RANDOM=y
++CONFIG_HW_RANDOM_ARM_SMCCC_TRNG=y
++CONFIG_I2C=y
++CONFIG_I2C_QCOM_CCI=y
++CONFIG_SPMI=y
++CONFIG_SPMI_MSM_PMIC_ARB=y
++CONFIG_PINCTRL_QCOM_SPMI_PMIC=y
++CONFIG_PINCTRL_SM6375=y
++CONFIG_POWER_RESET=y
++CONFIG_POWER_RESET_QCOM_PON=y
++CONFIG_MFD_SPMI_PMIC=y
++CONFIG_REGULATOR=y
++CONFIG_REGULATOR_FIXED_VOLTAGE=y
++CONFIG_REGULATOR_QCOM_SMD_RPM=y
++CONFIG_REGULATOR_QCOM_REFGEN=y
++CONFIG_COMMON_CLK=y
++CONFIG_COMMON_CLK_QCOM=y
++CONFIG_QCOM_CLK_SMD_RPM=y
++CONFIG_SM_GCC_6375=y
++CONFIG_MAILBOX=y
++CONFIG_QCOM_IPCC=y
++CONFIG_QCOM_APCS_IPC=y
++CONFIG_HWSPINLOCK=y
++CONFIG_HWSPINLOCK_QCOM=y
++CONFIG_QCOM_SCM=y
++CONFIG_QCOM_SMEM=y
++CONFIG_QCOM_SMD_RPM=y
++CONFIG_INTERCONNECT=y
++CONFIG_INTERCONNECT_QCOM=y
++CONFIG_INTERCONNECT_QCOM_HOLI_DISPLAY=y
++CONFIG_INTERCONNECT_QCOM_OSM_L3=y
++CONFIG_QCOM_SOCINFO=y
++CONFIG_QCOM_GENI_SE=y
++CONFIG_RPMSG_QCOM_GLINK_RPM=y
++CONFIG_QCOM_RPMPD=y
++CONFIG_QCOM_MPM=y
++CONFIG_QCOM_PDC=y
++CONFIG_ARM_SMMU=y
++CONFIG_ARM_SMMU_QCOM=y
++CONFIG_PHY_QCOM_USB_SNPS_FEMTO_V2=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_GADGET=y
++CONFIG_USB_DWC3_QCOM=y
++CONFIG_USB_CONFIGFS=y
++CONFIG_USB_CONFIGFS_ACM=y
++CONFIG_USB_CONFIGFS_NCM=y
++CONFIG_USB_CONFIGFS_ECM=y
++CONFIG_USB_CONFIGFS_RNDIS=y
++CONFIG_USB_CONFIGFS_MASS_STORAGE=y
++CONFIG_U_SERIAL_CONSOLE=y
++CONFIG_USB_GADGET_DEBUG_FILES=y
++CONFIG_USB_GADGET_DEBUG_FS=y
++CONFIG_NVMEM=y
++CONFIG_NVMEM_SPMI_SDAM=y
++CONFIG_EXT4_FS=y
++CONFIG_EXT4_FS_POSIX_ACL=y
++CONFIG_FANOTIFY=y
++CONFIG_AUTOFS_FS=y
++CONFIG_OVERLAY_FS=y
++CONFIG_FUSE_FS=y
++CONFIG_VFAT_FS=y
++CONFIG_NLS_CODEPAGE_437=y
++CONFIG_NLS_ISO8859_1=y
++CONFIG_PROC_FS=y
++CONFIG_TMPFS=y
++CONFIG_TMPFS_POSIX_ACL=y
++CONFIG_TMPFS_XATTR=y
++CONFIG_CONFIGFS_FS=y
++CONFIG_PSTORE=y
++CONFIG_PSTORE_CONSOLE=y
++CONFIG_PSTORE_PMSG=y
++CONFIG_PSTORE_RAM=y
++CONFIG_DEBUG_KERNEL=y
++CONFIG_DEBUG_FS=y
++CONFIG_MAGIC_SYSRQ=y
++CONFIG_PRINTK_TIME=y
++CONFIG_FB=y
++CONFIG_FB_SIMPLE=y
++CONFIG_FRAMEBUFFER_CONSOLE=y
++# CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER is not set
++CONFIG_FONT_8x16=y
++CONFIG_DEBUG_INFO_NONE=y
++# CONFIG_WERROR is not set
++CONFIG_SECURITY=y
++CONFIG_SECCOMP=y
++CONFIG_SECCOMP_FILTER=y
++CONFIG_KEYS=y
++CONFIG_CRYPTO=y
++CONFIG_CRYPTO_USER_API_HASH=y
++CONFIG_CRYPTO_USER_API_SKCIPHER=y
++
++# SDCC2 detection while root stays on NBD.
++CONFIG_MMC=y
++CONFIG_MMC_BLOCK=y
++CONFIG_MMC_SDHCI=y
++CONFIG_MMC_SDHCI_PLTFM=y
++CONFIG_MMC_SDHCI_MSM=y
++
++# First DRM/KMS panel takeover; software-rendered Wayland is the target.
++CONFIG_DRM=y
++CONFIG_DRM_MSM=y
++CONFIG_DRM_MSM_DPU=y
++CONFIG_DRM_MSM_DSI=y
++CONFIG_DRM_MSM_DSI_7NM_PHY=y
++CONFIG_DRM_PANEL_XIAOMI_K6S=y
++CONFIG_DRM_FBDEV_EMULATION=y
++CONFIG_SM_DISPCC_6375=y
++# V4L2/CAMSS and one-shot S5KHM2 identity probe. CSI streaming stays disabled.
++CONFIG_MEDIA_SUPPORT=y
++CONFIG_MEDIA_CAMERA_SUPPORT=y
++# CONFIG_MEDIA_ANALOG_TV_SUPPORT is not set
++# CONFIG_MEDIA_DIGITAL_TV_SUPPORT is not set
++# CONFIG_MEDIA_RADIO_SUPPORT is not set
++# CONFIG_MEDIA_SDR_SUPPORT is not set
++# CONFIG_MEDIA_TEST_SUPPORT is not set
++CONFIG_MEDIA_PLATFORM_SUPPORT=y
++CONFIG_MEDIA_CONTROLLER=y
++CONFIG_V4L_PLATFORM_DRIVERS=y
++CONFIG_VIDEO_DEV=y
++CONFIG_VIDEO_S5KHM2_ID_PROBE=y
++CONFIG_VIDEO_QCOM_CAMSS=y
++# CONFIG_DRM_MSM_MDP4 is not set
++# CONFIG_DRM_MSM_MDP5 is not set
++# CONFIG_DRM_MSM_DP is not set
++# CONFIG_DRM_MSM_HDMI is not set
++# Optional dependencies must not cap built-in MSM DRM at module linkage.
++# CONFIG_QCOM_LLCC is not set
++# CONFIG_QCOM_OCMEM is not set
++# CONFIG_DRM_MSM_DSI_28NM_PHY is not set
++# CONFIG_DRM_MSM_DSI_20NM_PHY is not set
++# CONFIG_DRM_MSM_DSI_28NM_8960_PHY is not set
++# CONFIG_DRM_MSM_DSI_14NM_PHY is not set
++# CONFIG_DRM_MSM_DSI_10NM_PHY is not set
++
++# Xiaomi SM6375 internal UFS storage (UFS2.2 device, UFS2.x host support).
++CONFIG_SCSI=y
++CONFIG_BLK_DEV_SD=y
++CONFIG_SCSI_UFSHCD=y
++CONFIG_SCSI_UFSHCD_PLATFORM=y
++CONFIG_SCSI_UFS_QCOM=y
++CONFIG_PCI=y
++CONFIG_PCI_MSI=y
++CONFIG_PHY_QCOM_QMP=y
++CONFIG_PHY_QCOM_QMP_UFS=y
++
++# Goodix GT9896 on QUP I2C8
++CONFIG_INPUT_TOUCHSCREEN=y
++CONFIG_TOUCHSCREEN_GOODIX_GTX8=y
++CONFIG_I2C_QCOM_GENI=y
++CONFIG_DMADEVICES=y
++CONFIG_QCOM_GPI_DMA=y
++
++# Adreno A619 GMU-wrapper bring-up
++CONFIG_SM_GPUCC_6375=y
++CONFIG_PM_DEVFREQ=y
++CONFIG_DEVFREQ_GOV_SIMPLE_ONDEMAND=y
++
++# TI BQ27Z561 battery telemetry; preserve the gauge's existing calibration.
++CONFIG_BATTERY_BQ27XXX=y
++CONFIG_BATTERY_BQ27XXX_I2C=y
++# CONFIG_BATTERY_BQ27XXX_DT_UPDATES_NVM is not set
++CONFIG_CHARGER_SYV690=y
++# CONFIG_CHARGER_SYV690_CONTROL is not set
++# CONFIG_CHARGER_SYV690_SWITCH is not set
++
++# Wi-Fi transport and manually started MPSS; other DSP nodes stay disabled.
++CONFIG_CFG80211=y
++CONFIG_MAC80211=y
++CONFIG_ATH10K=y
++CONFIG_ATH10K_SNOC=y
++CONFIG_ATH10K_DEBUG=y
++CONFIG_ATH10K_DEBUGFS=y
++CONFIG_QRTR=y
++CONFIG_QRTR_SMD=y
++CONFIG_REMOTEPROC=y
++CONFIG_QCOM_Q6V5_PAS=y
++CONFIG_QCOM_SYSMON=y
++CONFIG_RPMSG_QCOM_GLINK_SMEM=y
++CONFIG_QCOM_PDR_HELPERS=y
++CONFIG_QCOM_PDR_MSG=y
++CONFIG_QCOM_QMI_HELPERS=y
++
++# Installed phone firewall uses table inet and icmpx rejection.
++CONFIG_NF_TABLES_INET=y
++CONFIG_NFT_REJECT_INET=y
++CONFIG_NF_REJECT_IPV4=y
++CONFIG_NF_REJECT_IPV6=y
++
++CONFIG_QCOM_RMTFS_MEM=y
++
++CONFIG_FW_LOADER_COMPRESS=y
++CONFIG_FW_LOADER_COMPRESS_ZSTD=y
++
++# SM6375 IPA; keep the existing K6S display startup and ICC IDs.
++CONFIG_QCOM_IPA=y
++
++# IPA transports QMAP frames; RMNET supplies the logical IP links.
++CONFIG_RMNET=y

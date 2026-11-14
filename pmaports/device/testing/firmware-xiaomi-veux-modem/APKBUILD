@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+maintainer="hikari <me@metantesan.com>"
+pkgname=firmware-xiaomi-veux-modem
+pkgver=1
+pkgrel=3
+pkgdesc="Captured veux modem, GPU, IPA and ADSP firmware for mainline bring-up"
+url="https://postmarketos.org"
+arch="aarch64"
+license="proprietary"
+makedepends="zstd"
+options="!check !strip !archcheck pmb:cross-native"
+source="$pkgname.tar.zst gpu-firmware.tar ipa-firmware.tar adsp-firmware.tar modem_pr.tar.zst"
+builddir="$srcdir"
+
+package() {
+	install -d "$pkgdir/lib/firmware/qcom/xiaomi/veux"
+	install -m644 "$srcdir"/modem.* "$srcdir/wlanmdsp.mbn" \
+		"$pkgdir/lib/firmware/qcom/xiaomi/veux/"
+	cp -a "$srcdir/qcom/." "$pkgdir/lib/firmware/qcom/"
+	cp -a "$srcdir/modem_pr" "$pkgdir/lib/firmware/qcom/xiaomi/veux/"
+}
+
+# Filled in the staged copy; firmware binaries stay in ignored work/.
+sha512sums=""

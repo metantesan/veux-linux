@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Prepare RAM-only systemd units under the mounted future root.
+set -eu
+root=${1:-/sysroot}
+[ -x "$root/usr/lib/systemd/systemd" ] || { echo 'Missing systemd binary'; exit 1; }
+sshd=
+for daemon in /usr/sbin/sshd.pam /usr/sbin/sshd /usr/bin/sshd.pam /usr/bin/sshd; do
+    [ ! -x "$root$daemon" ] || { sshd=$daemon; break; }
+done
+[ -n "$sshd" ] || { echo 'Missing OpenSSH server'; exit 1; }
+[ -x "$root/usr/bin/ssh-keygen" ] || { echo 'Missing ssh-keygen'; exit 1; }
+units="$root/run/systemd/system"
+mkdir -p "$units"
+cat > "$root/run/mainline-usb-net" <<'SCRIPT'
+#!/bin/sh
+set -eu
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+iface=$(cat /sys/kernel/config/usb_gadget/veux_mainline/functions/ncm.usb0/ifname)
+ip link set lo up
+ip link set "$iface" up
+ip address replace 172.16.42.1/24 dev "$iface"
+SCRIPT
+chmod 755 "$root/run/mainline-usb-net"
+cat > "$units/mainline-usb-net.service" <<'UNIT'
+[Unit]
+Description=Keep USB networking available after switching to the SD root
+DefaultDependencies=no
+After=systemd-udevd.service
+Before=network.target mainline-sshd.service
+
+[Service]
+Type=oneshot
+ExecStart=/run/mainline-usb-net
+RemainAfterExit=yes
+UNIT
+cat > "$units/mainline-sshd.service" <<UNIT
+[Unit]
+Description=OpenSSH for mainline bring-up
+Requires=mainline-usb-net.service
+After=mainline-usb-net.service systemd-user-sessions.service
+
+[Service]
+Type=simple
+RuntimeDirectory=sshd
+ExecStartPre=/usr/bin/ssh-keygen -A
+ExecStart=$sshd -D -e
+Restart=on-failure
+UNIT
+cat > "$units/mainline-bringup.target" <<'UNIT'
+[Unit]
+Description=Minimal mainline bring-up with serial and SSH
+Requires=basic.target
+Wants=mainline-usb-net.service mainline-sshd.service serial-getty@ttyGS0.service systemd-user-sessions.service systemd-logind.service
+After=basic.target mainline-usb-net.service
+AllowIsolate=yes
+UNIT
+# NBD depends on this existing gadget/IP. Prevent another manager rebinding it.
+for service in systemd-networkd.service systemd-networkd-wait-online.service \
+    usb-moded.service usb-signaller.service routewrangler.service \
+    unudhcpd@usb0.service sshd.service dropbear.service; do
+    ln -sf /dev/null "$units/$service"
+done
+printf 'Prepared systemd bring-up target with %s\n' "$sshd"

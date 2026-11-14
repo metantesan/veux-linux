@@ -1,0 +1,1083 @@
+Subject: [PATCH 03/11] K6S panel, DSI, DPU, display clocks and UBWC
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/drivers/clk/qcom/dispcc-sm6375.c b/drivers/clk/qcom/dispcc-sm6375.c
+index 167dd369a..376d1399c 100644
+--- a/drivers/clk/qcom/dispcc-sm6375.c
++++ b/drivers/clk/qcom/dispcc-sm6375.c
+@@ -477,6 +477,7 @@ static struct clk_branch disp_cc_mdss_vsync_clk = {
+ };
+ 
+ static struct clk_branch disp_cc_sleep_clk = {
++	.halt_reg = 0x5004,
+ 	.halt_check = BRANCH_HALT,
+ 	.clkr = {
+ 		.enable_reg = 0x5004,
+@@ -490,6 +491,7 @@ static struct clk_branch disp_cc_sleep_clk = {
+ };
+ 
+ static struct clk_branch disp_cc_xo_clk = {
++	.halt_reg = 0x5008,
+ 	.halt_check = BRANCH_HALT,
+ 	.clkr = {
+ 		.enable_reg = 0x5008,
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index 42d0a529b..df0ac7965 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1136,6 +1136,9 @@ void dpu_crtc_commit_kickoff(struct drm_crtc *crtc)
+ 
+ 	reinit_completion(&dpu_crtc->frame_done_comp);
+ 
++	drm_for_each_encoder_mask(encoder, crtc->dev, crtc->state->encoder_mask)
++		dpu_encoder_start_dsi(encoder);
++
+ end:
+ 	DPU_ATRACE_END("crtc_commit");
+ }
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 1f20695f8..baee0e62f 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -9,10 +9,12 @@
+ 
+ #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
+ #include <linux/debugfs.h>
++#include <linux/iopoll.h>
+ #include <linux/kthread.h>
+ #include <linux/seq_file.h>
+ 
+ #include <drm/drm_atomic.h>
++#include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_file.h>
+ #include <drm/drm_probe_helper.h>
+@@ -653,6 +655,33 @@ struct drm_dsc_config *dpu_encoder_get_dsc_config(struct drm_encoder *drm_enc)
+ 	return NULL;
+ }
+ 
++static int dpu_encoder_wait_dsi_blank(void *data)
++{
++	struct dpu_encoder_phys *phys = data;
++	const struct drm_display_mode *mode;
++	u32 line, front_porch;
++
++	if (!phys || !phys->ops.get_line_count)
++		return -EINVAL;
++	mode = &phys->cached_mode;
++	front_porch = mode->vtotal - mode->vsync_start + mode->vdisplay;
++
++	return read_poll_timeout_atomic(phys->ops.get_line_count, line,
++			line >= front_porch && line < mode->vtotal,
++			1, 50000, false, phys);
++}
++
++void dpu_encoder_start_dsi(struct drm_encoder *drm_enc)
++{
++	struct msm_drm_private *priv = drm_enc->dev->dev_private;
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	int index = dpu_enc->disp_info.h_tile_instance[0];
++
++	if (dpu_enc->disp_info.intf_type == INTF_DSI)
++		msm_dsi_post_kickoff(priv->kms->dsi[index],
++				     dpu_encoder_wait_dsi_blank, dpu_enc->cur_master);
++}
++
+ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 				 struct msm_display_topology *topology,
+ 				 struct drm_atomic_commit *state,
+@@ -1962,12 +1991,44 @@ int dpu_encoder_vsync_time(struct drm_encoder *drm_enc, ktime_t *wakeup_time)
+ 	return 0;
+ }
+ 
++static u32 dpu_encoder_dsc_initial_line_calc_sm6375(struct drm_dsc_config *dsc,
++						 u32 enc_ip_width)
++{
++	u32 bpp = drm_dsc_get_bpp_int(dsc);
++	u32 soft_slices = enc_ip_width / dsc->slice_width;
++	u32 chunk_bits = dsc->slice_chunk_size * 8;
++	u32 input_latency, output_latency, extra_bits, total_pixels;
++
++	/*
++	 * SM6375's DSC core has a 64-bit output buffer, a maximum component
++	 * depth of 10 bits and a 48-bit mux word. Account for the output
++	 * buffer and the complete multi-slice latency, as the stock driver
++	 * does, before starting the video stream. The older 48-bit model
++	 * below underestimates this latency for the two-slice K6S panel.
++	 */
++	input_latency = 28 + 3 * (4 * (10 + 1) + 48 - 1 + 2) * soft_slices;
++	output_latency = DIV_ROUND_UP(9 * 64 + 48, bpp) + 1;
++	extra_bits = soft_slices > 1 ? chunk_bits :
++		((64 - bpp) * chunk_bits) >> 6;
++	total_pixels = dsc->initial_xmit_delay + input_latency +
++		output_latency + DIV_ROUND_UP(extra_bits, bpp);
++
++	return DIV_ROUND_UP(total_pixels, dsc->slice_width);
++}
++
+ static u32
+ dpu_encoder_dsc_initial_line_calc(struct drm_dsc_config *dsc,
+-				  u32 enc_ip_width)
++				u32 enc_ip_width,
++				const struct dpu_mdss_version *mdss_ver)
+ {
+ 	int ssm_delay, total_pixels, soft_slice_per_enc;
+ 
++	/* The captured SM6375 implementation uses this model for RGB DSC. */
++	if (mdss_ver->core_major_ver == 6 && mdss_ver->core_minor_ver == 9 &&
++	    !dsc->native_420 && !dsc->native_422 &&
++	    dsc->bits_per_component <= 10 && drm_dsc_get_bpp_int(dsc))
++		return dpu_encoder_dsc_initial_line_calc_sm6375(dsc, enc_ip_width);
++
+ 	soft_slice_per_enc = enc_ip_width / dsc->slice_width;
+ 
+ 	/*
+@@ -2052,7 +2113,8 @@ static void dpu_encoder_prep_dsc(struct dpu_encoder_virt *dpu_enc,
+ 	intf_ip_w = this_frame_slices * dsc->slice_width;
+ 
+ 	enc_ip_w = intf_ip_w / num_dsc;
+-	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w);
++	initial_lines = dpu_encoder_dsc_initial_line_calc(dsc, enc_ip_w,
++						      enc_master->hw_intf->mdss_ver);
+ 
+ 	for (i = 0; i < num_dsc; i++)
+ 		dpu_encoder_dsc_pipe_cfg(ctl, hw_dsc[i], hw_pp[i],
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index 4942097e7..8e0d4c81b 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -49,6 +49,7 @@ void dpu_encoder_prepare_for_kickoff(struct drm_encoder *encoder);
+ void dpu_encoder_trigger_kickoff_pending(struct drm_encoder *encoder);
+ 
+ void dpu_encoder_kickoff(struct drm_encoder *encoder);
++void dpu_encoder_start_dsi(struct drm_encoder *encoder);
+ 
+ int dpu_encoder_vsync_time(struct drm_encoder *drm_enc, ktime_t *wakeup_time);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index ac82b69ae..713dba177 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -257,6 +257,10 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
+ 	DPU_REG_WRITE(c, INTF_FRAME_LINE_COUNT_EN, 0x3);
+ 	DPU_REG_WRITE(c, INTF_CONFIG, intf_cfg);
+ 	DPU_REG_WRITE(c, INTF_PANEL_FORMAT, panel_format);
++	pr_info_once("veux scanout: fourcc=%#x bpc=%u/%u/%u format=%#x readback=%#x dsc=%u\n",
++		     fmt->pixel_format, fmt->bpc_g_y, fmt->bpc_b_cb,
++		     fmt->bpc_r_cr, panel_format,
++		     DPU_REG_READ(c, INTF_PANEL_FORMAT), p->compression_en);
+ 	if (intf->mdss_ver->core_major_ver >= 5) {
+ 		/*
+ 		 * DATA_HCTL_EN controls data timing which can be different from
+diff --git a/drivers/gpu/drm/msm/dsi/dsi.h b/drivers/gpu/drm/msm/dsi/dsi.h
+index 93c028a12..7cb1e8906 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi.h
++++ b/drivers/gpu/drm/msm/dsi/dsi.h
+@@ -43,6 +43,7 @@ struct msm_dsi {
+ 
+ 	struct device *phy_dev;
+ 	bool phy_enabled;
++	bool video_start_pending;
+ 
+ 	int id;
+ };
+@@ -69,6 +70,8 @@ int msm_dsi_host_cmd_rx(struct mipi_dsi_host *host,
+ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host,
+ 					u32 dma_base, u32 len);
+ int msm_dsi_host_enable(struct mipi_dsi_host *host);
++int msm_dsi_host_start_video(struct mipi_dsi_host *host,
++			     int (*wait_for_blank)(void *), void *data);
+ int msm_dsi_host_disable(struct mipi_dsi_host *host);
+ void msm_dsi_host_enable_irq(struct mipi_dsi_host *host);
+ void msm_dsi_host_disable_irq(struct mipi_dsi_host *host);
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index b292dfd26..f34c75077 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1462,10 +1462,18 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
+ 		ret = wait_for_completion_timeout(&msm_host->dma_comp,
+ 					msecs_to_jiffies(200));
+ 		DBG("ret=%d", ret);
+-		if (ret == 0)
++		if (ret == 0) {
++			dev_err(&msm_host->pdev->dev,
++				"DMA timeout: iova=%#llx len=%d ctrl=%#x status=%#x fifo=%#x intr=%#x trig=%#x\n",
++				dma_base, len, dsi_read(msm_host, REG_DSI_CTRL),
++				dsi_read(msm_host, REG_DSI_STATUS0),
++				dsi_read(msm_host, REG_DSI_FIFO_STATUS),
++				dsi_read(msm_host, REG_DSI_INTR_CTRL),
++				dsi_read(msm_host, REG_DSI_TRIG_CTRL));
+ 			ret = -ETIMEDOUT;
+-		else
++		} else {
+ 			ret = len;
++		}
+ 	} else {
+ 		ret = len;
+ 	}
+@@ -1633,6 +1641,10 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
+ 
+ 	/* fifo underflow, overflow */
+ 	if (status) {
++		dev_err_ratelimited(&msm_host->pdev->dev,
++				    "FIFO raw=%#x ctrl=%#x status=%#x\n", status,
++				    dsi_read(msm_host, REG_DSI_CTRL),
++				    dsi_read(msm_host, REG_DSI_STATUS0));
+ 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
+ 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
+ 		if (status & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)
+@@ -2438,6 +2450,9 @@ int msm_dsi_host_enable(struct mipi_dsi_host *host)
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 
++	if (!msm_host->power_on)
++		return -EINVAL;
++
+ 	dsi_op_mode_config(msm_host,
+ 		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), true);
+ 
+@@ -2454,10 +2469,70 @@ int msm_dsi_host_enable(struct mipi_dsi_host *host)
+ 	return 0;
+ }
+ 
++/* Start K6S in blanking with a clean FIFO, after DPU kickoff. */
++int msm_dsi_host_start_video(struct mipi_dsi_host *host,
++			     int (*wait_for_blank)(void *), void *data)
++{
++	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
++	u32 ctrl, clocks;
++	int ret;
++
++	if (!msm_host->power_on || msm_host->enabled || !wait_for_blank ||
++	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
++		return -EINVAL;
++
++	mutex_lock(&msm_host->dev_mutex);
++	mutex_lock(&msm_host->cmd_mutex);
++	ctrl = dsi_read(msm_host, REG_DSI_CTRL);
++	clocks = dsi_read(msm_host, REG_DSI_CLK_CTRL);
++	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 0);
++	/* All three engines must be stopped before forcing dynamic clocks. */
++	dsi_write(msm_host, REG_DSI_CTRL,
++		  ctrl & ~(DSI_CTRL_ENABLE | DSI_CTRL_VID_MODE_EN | DSI_CTRL_CMD_MODE_EN));
++	dsi_read(msm_host, REG_DSI_CTRL);
++	dsi_write(msm_host, REG_DSI_CLK_CTRL,
++		  clocks | DSI_CLK_CTRL_ENABLE_CLKS | BIT(8) | BIT(9) | BIT(11) | BIT(21));
++	dsi_read(msm_host, REG_DSI_CLK_CTRL);
++	dsi_write(msm_host, REG_DSI_RESET, 1);
++	dsi_read(msm_host, REG_DSI_RESET);
++	usleep_range(1000, 1100);
++	dsi_write(msm_host, REG_DSI_RESET, 0);
++	dsi_read(msm_host, REG_DSI_RESET);
++	dsi_write(msm_host, REG_DSI_CLK_CTRL, clocks);
++	dsi_read(msm_host, REG_DSI_CLK_CTRL);
++
++	reinit_completion(&msm_host->video_comp);
++	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_VIDEO_DONE, 1);
++	ret = wait_for_blank(data);
++	if (!ret) {
++		dsi_write(msm_host, REG_DSI_CTRL,
++			  (ctrl | DSI_CTRL_ENABLE | DSI_CTRL_VID_MODE_EN) & ~DSI_CTRL_CMD_MODE_EN);
++		dsi_read(msm_host, REG_DSI_CTRL);
++		if (!wait_for_completion_timeout(&msm_host->video_comp,
++						 msecs_to_jiffies(70)))
++			ret = -ETIMEDOUT;
++	}
++	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_VIDEO_DONE, 0);
++	if (ret) {
++		dsi_write(msm_host, REG_DSI_CTRL,
++			  ctrl & ~(DSI_CTRL_ENABLE | DSI_CTRL_VID_MODE_EN | DSI_CTRL_CMD_MODE_EN));
++		dsi_read(msm_host, REG_DSI_CTRL);
++	} else {
++		msm_host->enabled = true;
++	}
++	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
++	mutex_unlock(&msm_host->cmd_mutex);
++	mutex_unlock(&msm_host->dev_mutex);
++	return ret;
++}
++
+ int msm_dsi_host_disable(struct mipi_dsi_host *host)
+ {
+ 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+ 
++	if (!msm_host->enabled)
++		return 0;
++
+ 	msm_host->enabled = false;
+ 	dsi_op_mode_config(msm_host,
+ 		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), false);
+@@ -2528,8 +2603,20 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
+ 		goto fail_disable_clk;
+ 	}
+ 
++	/*
++	 * Do not let dsi_sw_reset() restore the bootloader's video-enable bit.
++	 * Its old video engine can remain busy after VID_MODE_EN is cleared,
++	 * blocking the first command while DPU is not yet producing frames.
++	 */
++	dev_info(&msm_host->pdev->dev, "cold host before reset: ctrl=%#x status=%#x\n",
++		 dsi_read(msm_host, REG_DSI_CTRL),
++		 dsi_read(msm_host, REG_DSI_STATUS0));
++	dsi_ctrl_disable(msm_host);
+ 	dsi_timing_setup(msm_host, is_bonded_dsi);
+ 	dsi_sw_reset(msm_host);
++	dev_info(&msm_host->pdev->dev, "cold host after reset: ctrl=%#x status=%#x\n",
++		 dsi_read(msm_host, REG_DSI_CTRL),
++		 dsi_read(msm_host, REG_DSI_STATUS0));
+ 	dsi_ctrl_enable(msm_host, phy_shared_timings, phy);
+ 
+ 	msm_host->power_on = true;
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_manager.c b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+index 959daa88b..c077347f7 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_manager.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_manager.c
+@@ -3,7 +3,10 @@
+  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/of.h>
++
+ #include "drm/drm_bridge_connector.h"
++#include <drm/drm_panel.h>
+ 
+ #include "msm_kms.h"
+ #include "dsi.h"
+@@ -208,6 +211,16 @@ static int dsi_mgr_bridge_get_id(struct drm_bridge *bridge)
+ 	return dsi_bridge->id;
+ }
+ 
++/* K6S requires its on commands and PPS before starting compressed video. */
++static bool dsi_mgr_bridge_defer_video(struct drm_bridge *bridge)
++{
++	struct msm_dsi *dsi = dsi_mgr_get_dsi(dsi_mgr_bridge_get_id(bridge));
++
++	return !IS_BONDED_DSI() &&
++		of_device_is_compatible(dsi->next_bridge->of_node,
++					"xiaomi,k6s-38-0c-0a");
++}
++
+ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
+ {
+ 	int id = dsi_mgr_bridge_get_id(bridge);
+@@ -297,6 +310,9 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge,
+ 		return;
+ 	}
+ 
++	if (dsi_mgr_bridge_defer_video(bridge))
++		return;
++
+ 	ret = msm_dsi_host_enable(host);
+ 	if (ret) {
+ 		pr_err("%s: enable host %d failed, %d\n", __func__, id, ret);
+@@ -319,6 +335,66 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge,
+ 	dsi_mgr_bridge_power_off(bridge);
+ }
+ 
++static void dsi_mgr_bridge_enable(struct drm_bridge *bridge,
++				  struct drm_atomic_commit *commit)
++{
++	struct msm_dsi *dsi = dsi_mgr_get_dsi(dsi_mgr_bridge_get_id(bridge));
++	struct drm_panel *panel;
++
++	if (!dsi_mgr_bridge_defer_video(bridge))
++		return;
++
++	panel = of_drm_find_panel(dsi->next_bridge->of_node);
++	if (IS_ERR(panel) || !panel->prepared) {
++		dev_err(&dsi->pdev->dev, "K6S prepare failed; video remains stopped\n");
++		return;
++	}
++
++	dsi->video_start_pending = true;
++	dev_info(&dsi->pdev->dev, "K6S waiting for DPU kickoff\n");
++}
++
++static void dsi_mgr_bridge_disable(struct drm_bridge *bridge,
++				   struct drm_atomic_commit *commit)
++{
++	struct msm_dsi *dsi = dsi_mgr_get_dsi(dsi_mgr_bridge_get_id(bridge));
++
++	/* Stop video before panel unprepare sends sleep-in. Keep clocks/IRQ on. */
++	if (dsi_mgr_bridge_defer_video(bridge)) {
++		dsi->video_start_pending = false;
++		msm_dsi_host_disable(dsi->host);
++	}
++}
++
++/* K6S must not feed video until the DPU timing engine is producing data. */
++void msm_dsi_post_kickoff(struct msm_dsi *dsi,
++			  int (*wait_for_blank)(void *), void *data)
++{
++	struct mipi_dsi_device *panel;
++	const u8 brightness[] = { 0x51, 0x01, 0x00 };
++	int ret;
++
++	if (!dsi || !dsi->video_start_pending)
++		return;
++
++	dsi->video_start_pending = false;
++	ret = msm_dsi_host_start_video(dsi->host, wait_for_blank, data);
++	if (ret) {
++		dev_err(&dsi->pdev->dev, "K6S video startup failed: %d; panel stays dark\n", ret);
++		return;
++	}
++
++	panel = of_find_mipi_dsi_device_by_node(dsi->next_bridge->of_node);
++	if (!panel)
++		return;
++	ret = mipi_dsi_dcs_write_buffer(panel, brightness, sizeof(brightness));
++	put_device(&panel->dev);
++	if (ret < 0)
++		dev_err(&dsi->pdev->dev, "K6S brightness failed: %d\n", ret);
++	else
++		dev_info(&dsi->pdev->dev, "K6S valid video before backlight\n");
++}
++
+ void msm_dsi_manager_tpg_enable(void)
+ {
+ 	struct msm_dsi *m_dsi = dsi_mgr_get_dsi(DSI_0);
+@@ -452,6 +528,8 @@ static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
+ 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
+ 	.attach = dsi_mgr_bridge_attach,
+ 	.atomic_pre_enable = dsi_mgr_bridge_pre_enable,
++	.atomic_enable = dsi_mgr_bridge_enable,
++	.atomic_disable = dsi_mgr_bridge_disable,
+ 	.atomic_post_disable = dsi_mgr_bridge_post_disable,
+ 	.mode_set = dsi_mgr_bridge_mode_set,
+ 	.mode_valid = dsi_mgr_bridge_mode_valid,
+diff --git a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+index 5d805a797..b6ef0755b 100644
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -957,6 +957,40 @@ static void dsi_phy_hw_v4_0_lane_settings(struct msm_dsi_phy *phy)
+ 	}
+ }
+ 
++static void dsi_7nm_k6s_stock_timing(struct msm_dsi_phy *phy,
++				  const struct msm_dsi_phy_clk_request *clk_req)
++{
++	struct msm_dsi_dphy_timing *timing = &phy->timing;
++	struct device_node *panel;
++	bool available;
++
++	/* Captured K6S table is for the stock 1.1 Gbit/s D-PHY mode only. */
++	if (phy->cfg != &dsi_phy_7nm_6375_cfgs || phy->cphy_mode ||
++	    clk_req->bitclk_rate < 1099000000UL ||
++	    clk_req->bitclk_rate > 1101000000UL)
++		return;
++
++	panel = of_find_compatible_node(NULL, NULL, "xiaomi,k6s-38-0c-0a");
++	available = panel && of_device_is_available(panel);
++	of_node_put(panel);
++	if (!available)
++		return;
++
++	/* qcom,mdss-dsi-panel-phy-timings in the captured stock K6S DT. */
++	timing->clk_zero = 0x23;
++	timing->clk_prepare = 0x09;
++	timing->clk_trail = 0x09;
++	timing->hs_exit = 0x1a;
++	timing->hs_zero = 0x18;
++	timing->hs_prepare = 0x09;
++	timing->hs_trail = 0x09;
++	timing->hs_rqst = 0x09;
++	timing->shared_timings.clk_pre = 0x1d;
++	timing->shared_timings.clk_post = 0x0e;
++	dev_info(&phy->pdev->dev, "K6S stock PHY timing at %lu bit/s\n",
++		 clk_req->bitclk_rate);
++}
++
+ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
+ 			      struct msm_dsi_phy_clk_request *clk_req)
+ {
+@@ -987,6 +1021,8 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
+ 		return -EINVAL;
+ 	}
+ 
++	dsi_7nm_k6s_stock_timing(phy, clk_req);
++
+ 	if (dsi_phy_hw_v4_0_is_pll_on(phy))
+ 		pr_warn("PLL turned on before configuring PHY\n");
+ 
+diff --git a/drivers/gpu/drm/msm/msm_debugfs.c b/drivers/gpu/drm/msm/msm_debugfs.c
+index f12701e28..91aa954c8 100644
+--- a/drivers/gpu/drm/msm/msm_debugfs.c
++++ b/drivers/gpu/drm/msm/msm_debugfs.c
+@@ -387,6 +387,29 @@ static void msm_debugfs_gpu_init(struct drm_minor *minor)
+ 			   &priv->gpu_devfreq_config.downdifferential);
+ }
+ 
++static ssize_t msm_gpu_init_once_write(struct file *file,
++				       const char __user *buf, size_t count,
++				       loff_t *ppos)
++{
++	bool start;
++	int ret;
++
++	ret = kstrtobool_from_user(buf, count, &start);
++	if (ret)
++		return ret;
++	if (!start)
++		return -EINVAL;
++
++	ret = msm_gpu_init_once(file->private_data);
++	return ret ? ret : count;
++}
++
++static const struct file_operations msm_gpu_init_once_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = msm_gpu_init_once_write,
++};
++
+ void msm_debugfs_init(struct drm_minor *minor)
+ {
+ 	struct drm_device *dev = minor->dev;
+@@ -402,6 +425,9 @@ void msm_debugfs_init(struct drm_minor *minor)
+ 	if (priv->kms)
+ 		msm_debugfs_kms_init(minor);
+ 
++	debugfs_create_file("gpu_init_once", 0200, minor->debugfs_root,
++			    dev, &msm_gpu_init_once_fops);
++
+ 	debugfs_create_file("shrink", S_IRWXU, minor->debugfs_root,
+ 		dev, &shrink_fops);
+ 
+diff --git a/drivers/gpu/drm/msm/msm_drv.c b/drivers/gpu/drm/msm/msm_drv.c
+index f3d2eaa04..74fde202e 100644
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -195,17 +195,52 @@ static int msm_drm_init(struct device *dev, const struct drm_driver *drv,
+  * DRM operations:
+  */
+ 
++/* Diagnostic kernel: automatic DRM opens must not power up an unverified GPU. */
++static bool gpu_manual_init = true;
++module_param(gpu_manual_init, bool, 0400);
++MODULE_PARM_DESC(gpu_manual_init, "Require root gpu_init_once debugfs write for GPU activation");
++static DEFINE_MUTEX(gpu_init_lock);
++
+ static void load_gpu(struct drm_device *dev)
+ {
+-	static DEFINE_MUTEX(init_lock);
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 
+-	mutex_lock(&init_lock);
++	if (gpu_manual_init)
++		return;
+ 
++	mutex_lock(&gpu_init_lock);
+ 	if (!priv->gpu)
+ 		priv->gpu = adreno_load_gpu(dev);
++	mutex_unlock(&gpu_init_lock);
++}
++
++int msm_gpu_init_once(struct drm_device *dev)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++	int ret;
++
++	if (!gpu_manual_init)
++		return -EOPNOTSUPP;
+ 
+-	mutex_unlock(&init_lock);
++	mutex_lock(&gpu_init_lock);
++	if (priv->gpu_init_attempted) {
++		ret = -EALREADY;
++		goto out;
++	}
++	if (!priv->gpu_pdev) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	/* Consume before entering hardware code; no implicit retry after failure. */
++	priv->gpu_init_attempted = true;
++	dev_info(dev->dev, "GPU-DIAG manual initialization begin\n");
++	priv->gpu = adreno_load_gpu(dev);
++	ret = priv->gpu ? 0 : -EIO;
++	dev_info(dev->dev, "GPU-DIAG manual initialization end: %d\n", ret);
++out:
++	mutex_unlock(&gpu_init_lock);
++	return ret;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index eb4bbae85..44264fd91 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -81,6 +81,7 @@ struct msm_drm_private {
+ 
+ 	/* when we have more than one 'msm_gpu' these need to be an array: */
+ 	struct msm_gpu *gpu;
++	bool gpu_init_attempted;
+ 
+ 	/* gpu is only set on open(), but we need this info earlier */
+ 	bool is_a2xx;
+@@ -240,6 +241,7 @@ void msm_perfcntr_cleanup(struct msm_gpu *gpu);
+ unsigned long msm_gem_shrinker_shrink(struct drm_device *dev, unsigned long nr_to_scan);
+ #endif
+ 
++int msm_gpu_init_once(struct drm_device *dev);
+ int msm_gem_shrinker_init(struct drm_device *dev);
+ void msm_gem_shrinker_cleanup(struct drm_device *dev);
+ 
+@@ -290,6 +292,8 @@ static inline void __exit msm_hdmi_unregister(void) {}
+ 
+ struct msm_dsi;
+ #ifdef CONFIG_DRM_MSM_DSI
++void msm_dsi_post_kickoff(struct msm_dsi *dsi,
++			  int (*wait_for_blank)(void *), void *data);
+ int dsi_dev_attach(struct platform_device *pdev);
+ void dsi_dev_detach(struct platform_device *pdev);
+ void __init msm_dsi_register(void);
+@@ -304,6 +308,10 @@ bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
+ struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
+ const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi);
+ #else
++static inline void msm_dsi_post_kickoff(struct msm_dsi *dsi,
++					int (*wait_for_blank)(void *), void *data)
++{
++}
+ static inline void __init msm_dsi_register(void)
+ {
+ }
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index cbdf7b8f7..134522250 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -1406,6 +1406,14 @@ config DRM_PANEL_WIDECHIPS_WS2401
+ 	  480x800 display controller used in panels such as Samsung LMS380KF01.
+ 	  This display is used in the Samsung Galaxy Ace 2 GT-I8160 (Codina).
+ 
++config DRM_PANEL_XIAOMI_K6S
++	tristate "Xiaomi K6S 38/0c/0a DSC panel"
++	depends on OF && DRM_MIPI_DSI
++	select DRM_DISPLAY_DSC_HELPER
++	help
++	  Experimental bootloader-powered takeover for the Xiaomi veux
++	  1080x2400 K6S panel. Full panel power management is not implemented.
++
+ config DRM_PANEL_XINPENG_XPP055C272
+ 	tristate "Xinpeng XPP055C272 panel driver"
+ 	depends on OF
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index 3b523cf37..109609aec 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -137,3 +137,4 @@ obj-$(CONFIG_DRM_PANEL_VISIONOX_VTDR6130) += panel-visionox-vtdr6130.o
+ obj-$(CONFIG_DRM_PANEL_VISIONOX_R66451) += panel-visionox-r66451.o
+ obj-$(CONFIG_DRM_PANEL_WIDECHIPS_WS2401) += panel-widechips-ws2401.o
+ obj-$(CONFIG_DRM_PANEL_XINPENG_XPP055C272) += panel-xinpeng-xpp055c272.o
++obj-$(CONFIG_DRM_PANEL_XIAOMI_K6S) += panel-xiaomi-k6s.o
+diff --git a/drivers/soc/qcom/ubwc_config.c b/drivers/soc/qcom/ubwc_config.c
+index 23901a4c5..424ed7991 100644
+--- a/drivers/soc/qcom/ubwc_config.c
++++ b/drivers/soc/qcom/ubwc_config.c
+@@ -13,6 +13,8 @@
+ #include <linux/soc/qcom/ubwc.h>
+ #include <linux/soc/qcom/smem.h>
+ 
++#include <dt-bindings/arm/qcom,ids.h>
++
+ static const struct qcom_ubwc_cfg_data no_ubwc_data = {
+ 	/* no UBWC, no HBB */
+ };
+@@ -190,6 +192,18 @@ const struct qcom_ubwc_cfg_data *qcom_ubwc_config_get_data(void)
+ 		return ERR_PTR(-EPROBE_DEFER);
+ 
+ 	data = of_machine_get_match_data(qcom_ubwc_configs);
++	if (!data) {
++		u32 soc_id;
++		int ret;
++
++		/* Some bootloaders replace the root compatibles with downstream names. */
++		ret = qcom_smem_get_soc_id(&soc_id);
++		if (ret)
++			return ERR_PTR(ret);
++
++		if (soc_id == QCOM_ID_SM6375)
++			data = &ubwc_2_0_hbb14;
++	}
+ 	if (!data) {
+ 		pr_err("Couldn't find UBWC config data for this platform!\n");
+ 		return ERR_PTR(-EINVAL);
+diff --git a/Documentation/devicetree/bindings/display/panel/xiaomi,k6s-38-0c-0a.yaml b/Documentation/devicetree/bindings/display/panel/xiaomi,k6s-38-0c-0a.yaml
+new file mode 100644
+index 000000000..de892d80c
+--- /dev/null
++++ b/Documentation/devicetree/bindings/display/panel/xiaomi,k6s-38-0c-0a.yaml
+@@ -0,0 +1,52 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/display/panel/xiaomi,k6s-38-0c-0a.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Xiaomi K6S 38/0c/0a 1080x2400 DSC AMOLED panel
++
++maintainers:
++  - hikari <me@metantesan.com>
++
++description: |
++  Four-lane video-mode DSI panel with DSC 1.1. This local bring-up binding
++  describes bootloader-powered takeover only. Panel supplies, reset and
++  enable controls must be added when full power sequencing is implemented.
++
++allOf:
++  - $ref: panel-common.yaml#
++
++properties:
++  compatible:
++    const: xiaomi,k6s-38-0c-0a
++
++  reg:
++    maxItems: 1
++
++  port: true
++
++required:
++  - compatible
++  - reg
++  - port
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    dsi {
++        #address-cells = <1>;
++        #size-cells = <0>;
++
++        panel@0 {
++            compatible = "xiaomi,k6s-38-0c-0a";
++            reg = <0>;
++
++            port {
++                panel_in: endpoint {
++                    remote-endpoint = <&dsi_out>;
++                };
++            };
++        };
++    };
+diff --git a/drivers/gpu/drm/panel/panel-xiaomi-k6s.c b/drivers/gpu/drm/panel/panel-xiaomi-k6s.c
+new file mode 100644
+index 000000000..6b73c40f1
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-xiaomi-k6s.c
+@@ -0,0 +1,311 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Xiaomi K6S 38/0c/0a. Commands/timing: Xiaomi downstream m17 K6S DTS.
++ * Experimental bootloader-powered takeover: panel rails and enable are
++ * deliberately not controlled until their complete power sequence is verified.
++ */
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <video/mipi_display.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_panel.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/display/drm_dsc.h>
++#include <drm/display/drm_dsc_helper.h>
++
++struct xiaomi_k6s {
++	struct drm_panel panel;
++	struct mipi_dsi_device *dsi;
++	bool initialized;
++	struct drm_dsc_config dsc;
++};
++
++static struct xiaomi_k6s *to_k6s(struct drm_panel *panel)
++{
++	return container_of(panel, struct xiaomi_k6s, panel);
++}
++
++/* Vendor commands use long packets even when their payload is two bytes. */
++static void xiaomi_k6s_dcs_long_multi(struct mipi_dsi_multi_context *ctx,
++				    const void *data, size_t len)
++{
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	struct mipi_dsi_msg msg = {
++		.channel = dsi->channel,
++		.type = MIPI_DSI_DCS_LONG_WRITE,
++		.tx_buf = data,
++		.tx_len = len,
++	};
++	ssize_t ret;
++
++	if (ctx->accum_err)
++		return;
++	if (dsi->mode_flags & MIPI_DSI_MODE_LPM)
++		msg.flags |= MIPI_DSI_MSG_USE_LPM;
++	if (!dsi->host->ops || !dsi->host->ops->transfer) {
++		ctx->accum_err = -EOPNOTSUPP;
++		return;
++	}
++
++	ret = dsi->host->ops->transfer(dsi->host, &msg);
++	if (ret < 0) {
++		dev_err(&dsi->dev, "vendor command %#x failed: %zd\n",
++			*(const u8 *)data, ret);
++		ctx->accum_err = ret;
++	}
++}
++
++#define xiaomi_k6s_dcs_long_seq_multi(ctx, seq...) do { \
++	static const u8 data[] = { seq }; \
++	xiaomi_k6s_dcs_long_multi(ctx, data, ARRAY_SIZE(data)); \
++} while (0)
++
++/* Preserve the vendor initialization payload; the standard PPS follows on. */
++static const u8 xiaomi_k6s_vendor_pps[] = {
++	0x9e, 0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x09, 0x60, 0x04, 0x38, 0x00,
++	0x28, 0x02, 0x1c, 0x02, 0x1c, 0x02, 0x00, 0x02, 0x0e, 0x00, 0x20, 0x03,
++	0xdd, 0x00, 0x07, 0x00, 0x0c, 0x02, 0x77, 0x02, 0x8b, 0x18, 0x00, 0x10,
++	0xf0, 0x03, 0x0c, 0x20, 0x00, 0x06, 0x0b, 0x0b, 0x33, 0x0e, 0x1c, 0x2a,
++	0x38, 0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b, 0x7d, 0x7e, 0x01,
++	0x02, 0x01, 0x00, 0x09, 0x40, 0x09, 0xbe, 0x19, 0xfc, 0x19, 0xfa, 0x19,
++	0xf8, 0x1a, 0x38, 0x1a, 0x78, 0x1a, 0xb6, 0x2a, 0xf6, 0x2b, 0x34, 0x2b,
++	0x74, 0x3b, 0x74, 0x6b, 0xf4, 0x00,
++};
++
++static void xiaomi_k6s_read_status(struct xiaomi_k6s *ctx)
++{
++	struct mipi_dsi_device *dsi = ctx->dsi;
++	u8 id[3] = { 0 }, power = 0, format = 0;
++	ssize_t id_ret;
++	int power_ret, format_ret;
++
++	/* Bounded standard DCS reads, while command transport is still idle. */
++	id_ret = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DISPLAY_ID, id, sizeof(id));
++	power_ret = mipi_dsi_dcs_get_power_mode(dsi, &power);
++	format_ret = mipi_dsi_dcs_get_pixel_format(dsi, &format);
++	dev_info(&dsi->dev,
++		 "panel readback: id_ret=%zd id=%02x%02x%02x power_ret=%d power=%#x format_ret=%d format=%#x\n",
++		 id_ret, id[0], id[1], id[2], power_ret, power,
++		 format_ret, format);
++}
++
++static void xiaomi_k6s_finish_init(struct xiaomi_k6s *ctx,
++				   struct mipi_dsi_multi_context *dsi_ctx)
++{
++	struct drm_dsc_picture_parameter_set pps;
++
++	/* Downstream completes on, selects 120 Hz, then sends packet type 0x0a. */
++	mipi_dsi_msleep(dsi_ctx, 100);
++	mipi_dsi_dcs_set_display_on_multi(dsi_ctx);
++	xiaomi_k6s_dcs_long_seq_multi(dsi_ctx, 0xf0, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(dsi_ctx, 0x60, 0x01);
++	xiaomi_k6s_dcs_long_seq_multi(dsi_ctx, 0xf7, 0x0b);
++	xiaomi_k6s_dcs_long_seq_multi(dsi_ctx, 0xf0, 0xa5, 0xa5);
++	if (dsi_ctx->accum_err)
++		return;
++
++	if (ctx->dsc.pic_width != 1080 || ctx->dsc.pic_height != 2400 ||
++	    !ctx->dsc.slice_chunk_size) {
++		dsi_ctx->accum_err = -EINVAL;
++		dev_err(&ctx->dsi->dev, "host DSC parameters are not ready\n");
++		return;
++	}
++
++	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
++	mipi_dsi_picture_parameter_set_multi(dsi_ctx, &pps);
++	/* Keep brightness zero until the host confirms its first video frame. */
++	if (!dsi_ctx->accum_err)
++		xiaomi_k6s_read_status(ctx);
++	ctx->initialized = !dsi_ctx->accum_err;
++	if (ctx->initialized)
++		dev_info(&ctx->dsi->dev,
++			 "panel on and PPS complete: %ux%u, slice %ux%u, two slices/packet\n",
++			 ctx->dsc.pic_width, ctx->dsc.pic_height,
++			 ctx->dsc.slice_width, ctx->dsc.slice_height);
++}
++
++static int xiaomi_k6s_prepare(struct drm_panel *panel)
++{
++	struct xiaomi_k6s *ctx = to_k6s(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	ctx->initialized = false;
++	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x11);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb2, 0x01, 0x31);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xdf, 0x09, 0x30, 0x95, 0x46, 0xe9);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0x9d, 0x01);
++	xiaomi_k6s_dcs_long_multi(&dsi_ctx, xiaomi_k6s_vendor_pps,
++				      sizeof(xiaomi_k6s_vendor_pps));
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0x60, 0x21);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf7, 0x0b);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x15, 0xf6);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf6, 0xf0);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x28, 0xf6);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf6, 0xf0);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x3b, 0xf6);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf6, 0xf0);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x0a, 0xf4);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf4, 0x98);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x11, 0xf4);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf4, 0xee);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x18, 0xb2);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb2, 0x1c);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xfc, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x11, 0xfe);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xfe, 0x00);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x0d, 0xb2);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb2, 0x20);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x0c, 0xb2);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb2, 0x30);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf7, 0x0b);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xfc, 0x5a, 0x5a);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xed, 0x01, 0xcd, 0x00);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xe1, 0x93);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xb0, 0x00, 0x06, 0xf4);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf4, 0x1f);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0xfc, 0xa5, 0xa5);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0x53, 0x20);
++	xiaomi_k6s_dcs_long_seq_multi(&dsi_ctx, 0x51, 0x00, 0x00);
++	xiaomi_k6s_finish_init(ctx, &dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 100);
++	return dsi_ctx.accum_err;
++}
++
++static int xiaomi_k6s_enable(struct drm_panel *panel)
++{
++	struct xiaomi_k6s *ctx = to_k6s(panel);
++
++	/* No command DMA here: video is enabled but DPU has not kicked off yet. */
++	return ctx->initialized ? 0 : -EIO;
++}
++
++static int xiaomi_k6s_disable(struct drm_panel *panel)
++{
++	struct xiaomi_k6s *ctx = to_k6s(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	if (!ctx->initialized)
++		return 0;
++
++	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 20);
++	return dsi_ctx.accum_err;
++}
++
++static int xiaomi_k6s_unprepare(struct drm_panel *panel)
++{
++	struct xiaomi_k6s *ctx = to_k6s(panel);
++	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	ctx->initialized = false;
++	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
++	mipi_dsi_msleep(&dsi_ctx, 150);
++	return dsi_ctx.accum_err;
++}
++
++static const struct drm_display_mode xiaomi_k6s_mode = {
++	.clock = 393400,
++	.hdisplay = 1080,
++	.hsync_start = 1080 + 120,
++	.hsync_end = 1080 + 120 + 28,
++	.htotal = 1080 + 120 + 28 + 120,
++	.vdisplay = 2400,
++	.vsync_start = 2400 + 20,
++	.vsync_end = 2400 + 20 + 2,
++	.vtotal = 2400 + 20 + 2 + 10,
++	.width_mm = 70,
++	.height_mm = 155,
++	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++};
++
++static int xiaomi_k6s_get_modes(struct drm_panel *panel,
++							  struct drm_connector *connector)
++{
++	return drm_connector_helper_get_modes_fixed(connector, &xiaomi_k6s_mode);
++}
++
++static const struct drm_panel_funcs xiaomi_k6s_funcs = {
++	.prepare = xiaomi_k6s_prepare,
++	.enable = xiaomi_k6s_enable,
++	.disable = xiaomi_k6s_disable,
++	.unprepare = xiaomi_k6s_unprepare,
++	.get_modes = xiaomi_k6s_get_modes,
++};
++
++static int xiaomi_k6s_probe(struct mipi_dsi_device *dsi)
++{
++	struct xiaomi_k6s *ctx;
++	struct drm_dsc_config *dsc;
++	int ret;
++
++	ctx = devm_drm_panel_alloc(&dsi->dev, struct xiaomi_k6s, panel,
++							   &xiaomi_k6s_funcs, DRM_MODE_CONNECTOR_DSI);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	ctx->dsi = dsi;
++	dsc = &ctx->dsc;
++	dsc->dsc_version_major = 1;
++	dsc->dsc_version_minor = 1;
++	dsc->slice_height = 20;
++	dsc->slice_width = 540;
++	dsc->slice_count = 2;
++	dsc->bits_per_component = 8;
++	dsc->bits_per_pixel = 8 << 4;
++	dsc->block_pred_enable = true;
++	dsi->dsc = dsc;
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
++			  MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT;
++	ctx->panel.prepare_prev_first = true;
++	mipi_dsi_set_drvdata(dsi, ctx);
++	drm_panel_add(&ctx->panel);
++	ret = mipi_dsi_attach(dsi);
++	if (ret)
++		drm_panel_remove(&ctx->panel);
++	return ret;
++}
++
++static void xiaomi_k6s_remove(struct mipi_dsi_device *dsi)
++{
++	struct xiaomi_k6s *ctx = mipi_dsi_get_drvdata(dsi);
++	int ret;
++
++	ret = mipi_dsi_detach(dsi);
++	if (ret)
++		dev_err(&dsi->dev, "DSI detach failed: %d\n", ret);
++	drm_panel_remove(&ctx->panel);
++}
++
++static const struct of_device_id xiaomi_k6s_of_match[] = {
++	{ .compatible = "xiaomi,k6s-38-0c-0a" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, xiaomi_k6s_of_match);
++
++static struct mipi_dsi_driver xiaomi_k6s_driver = {
++	.probe = xiaomi_k6s_probe,
++	.remove = xiaomi_k6s_remove,
++	.driver = {
++		.name = "panel-xiaomi-k6s",
++		.of_match_table = xiaomi_k6s_of_match,
++	},
++};
++module_mipi_dsi_driver(xiaomi_k6s_driver);
++
++MODULE_DESCRIPTION("Xiaomi K6S 38/0c/0a experimental DSC panel");
++MODULE_LICENSE("GPL");

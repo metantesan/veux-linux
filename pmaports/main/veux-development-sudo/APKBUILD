@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Explicitly installed in the phone's development image.
+maintainer="hikari <me@metantesan.com>"
+pkgname=veux-development-sudo
+pkgver=1
+pkgrel=1
+pkgdesc="Passwordless sudo for all users in the veux development image"
+url="https://postmarketos.org"
+arch="noarch"
+license="GPL-2.0-only"
+depends="sudo-virt"
+source="99-veux-development"
+options="!check !archcheck"
+
+package() {
+	install -Dm440 "$srcdir/99-veux-development" \
+		"$pkgdir/etc/sudoers.d/99-veux-development"
+}
+
+# Filled in the staged copy by stage-rootfs-packages.py.
+sha512sums=""

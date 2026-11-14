@@ -1,0 +1,137 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Mainline bring-up from the installed microSD root.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /sysroot /sys/kernel/config
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /run
+mount -t configfs configfs /sys/kernel/config
+ip link set lo up
+exec >>/run/mainline-init.log 2>&1
+log() {
+	echo "veux-mainline: $*"
+	echo "veux-mainline: $*" >/dev/kmsg
+}
+log "PID 1 reached: $(uname -r)"
+mount -t debugfs debugfs /sys/kernel/debug
+mkdir -p /sys/fs/pstore
+mount -t pstore pstore /sys/fs/pstore
+
+# Create both functions before binding: rebinding would break the NBD link.
+g=/sys/kernel/config/usb_gadget/veux_mainline
+mkdir -p "$g"
+echo 0x18d1 >"$g/idVendor"
+echo 0xd001 >"$g/idProduct"
+echo 0xef >"$g/bDeviceClass"
+echo 2 >"$g/bDeviceSubClass"
+echo 1 >"$g/bDeviceProtocol"
+mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409"
+echo postmarketOS >"$g/strings/0x409/serialnumber"
+echo Xiaomi >"$g/strings/0x409/manufacturer"
+echo 'Xiaomi Redmi Note 11 Pro 5G' >"$g/strings/0x409/product"
+echo 'USB serial and netboot' >"$g/configs/c.1/strings/0x409/configuration"
+echo 250 >"$g/configs/c.1/MaxPower"
+mkdir -p "$g/functions/acm.usb0" "$g/functions/ncm.usb0"
+echo 02:00:00:00:42:01 >"$g/functions/ncm.usb0/dev_addr"
+echo 02:00:00:00:42:02 >"$g/functions/ncm.usb0/host_addr"
+ln -s "$g/functions/acm.usb0" "$g/configs/c.1/acm.usb0"
+ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/ncm.usb0"
+udc=
+for attempt in $(seq 1 60); do
+	for controller in /sys/class/udc/*; do
+		[ -e "$controller" ] || continue
+		udc=${controller##*/}
+		break
+	done
+	[ -z "$udc" ] || break
+	sleep 1
+done
+if [ -z "$udc" ] || ! echo "$udc" >"$g/UDC"; then
+	log 'ERROR: no usable UDC. Inspect pstore after recovery; netboot has not started.'
+	cat /sys/kernel/debug/devices_deferred
+	while :; do sleep 30; done
+fi
+log "ACM + NCM bound to $udc"
+for device in /sys/bus/platform/devices/*usb*/power/control; do
+	[ ! -e "$device" ] || echo on >"$device"
+done
+
+# A serial shell is available even while the server is absent or NBD is stuck.
+(
+	while :; do
+		setsid getty -L -n -l /bin/mainline-shell 115200 ttyGS0 vt100
+		sleep 1
+	done
+) &
+iface=$(cat "$g/functions/ncm.usb0/ifname")
+ip link set "$iface" up
+ip address add 172.16.42.1/24 dev "$iface"
+unudhcpd -i "$iface" -s 172.16.42.1 -c 172.16.42.2 &
+log "USB network $iface: phone 172.16.42.1; host 172.16.42.2"
+
+# The host and phone can assign different mmcblk indices. Scan MMC partition 2
+# devices and identify the installed root by its init executable. A serial
+# shell remains available only if the card or filesystem is unavailable.
+log 'Waiting for the installed SD root on an MMC partition 2'
+rootdev=
+mounted=
+for attempt in $(seq 1 90); do
+	for candidate in /dev/mmcblk*p2; do
+		[ -b "$candidate" ] || continue
+		if mount -t ext4 -o rw "$candidate" /sysroot; then
+			if [ -x /sysroot/usr/lib/systemd/systemd ] || [ -x /sysroot/sbin/init ]; then
+				rootdev=$candidate
+				mounted=yes
+				break
+			fi
+			log "Mounted $candidate but no supported init was found; unmounting"
+			umount /sysroot
+		fi
+	done
+	[ "$mounted" = yes ] && break
+	sleep 1
+done
+[ "$mounted" = yes ] || {
+	log 'ERROR: SD root did not mount; initramfs serial shell is available'
+	while :; do sleep 30; done
+}
+log "SD root mounted at /sysroot; continuing automatically"
+cat /sysroot/etc/os-release
+mount -t tmpfs -o mode=0755 tmpfs /sysroot/run || exit 1
+cp /run/mainline-init.log /sysroot/run/mainline-init.log
+init=/sbin/init
+if [ -x /sysroot/usr/lib/systemd/systemd ]; then
+	/bin/mainline-systemd-setup /sysroot || exit 1
+	init=/usr/lib/systemd/systemd
+else
+	cp -a /sysroot/etc/init.d /sysroot/run/mainline-init.d || exit 1
+	cp /bin/mainline-usb-net.openrc /sysroot/run/mainline-init.d/mainline-usb-net
+	chmod 755 /sysroot/run/mainline-init.d/mainline-usb-net
+	mount --bind /sysroot/run/mainline-init.d /sysroot/etc/init.d || exit 1
+	cp -a /sysroot/etc/runlevels /sysroot/run/mainline-runlevels || exit 1
+	# Keep the initramfs DHCP daemon alive; avoid starting a second daemon.
+	rm -f /sysroot/run/mainline-runlevels/boot/unudhcpd.usb0
+	rm -rf /sysroot/run/mainline-runlevels/default
+	mkdir /sysroot/run/mainline-runlevels/default
+	ln -s /etc/init.d/mainline-usb-net /sysroot/run/mainline-runlevels/default/mainline-usb-net
+	ln -s /etc/init.d/dropbear /sysroot/run/mainline-runlevels/default/dropbear
+	mount --bind /sysroot/run/mainline-runlevels /sysroot/etc/runlevels || exit 1
+	sed 's@/sbin/openrc sysinit$@/sbin/openrc sysinit </dev/ttyGS0 >/dev/ttyGS0 2>\&1@;s@/sbin/openrc boot$@/sbin/openrc boot </dev/ttyGS0 >/dev/ttyGS0 2>\&1@;s@/sbin/openrc default$@/sbin/openrc default </dev/ttyGS0 >/dev/ttyGS0 2>\&1@' /sysroot/etc/inittab > /sysroot/run/mainline-inittab
+	echo 'ttyGS0::respawn:/sbin/getty -L 115200 ttyGS0 vt100' >> /sysroot/run/mainline-inittab
+	mount --bind /sysroot/run/mainline-inittab /sysroot/etc/inittab || exit 1
+fi
+# Stop the initramfs serial login loop before rootfs init replaces it.
+for pid in $(pidof sh getty); do
+	[ "$pid" = 1 ] || kill -KILL "$pid" 2>/dev/null
+done
+for fs in dev proc sys; do
+	mount --move "/$fs" "/sysroot/$fs" || exit 1
+done
+if [ "$init" = /usr/lib/systemd/systemd ]; then
+	exec switch_root /sysroot "$init" --unit=mainline-bringup.target --log-target=journal-or-kmsg
+fi
+exec switch_root /sysroot "$init"

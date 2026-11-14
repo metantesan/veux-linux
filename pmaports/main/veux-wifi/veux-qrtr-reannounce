@@ -1,0 +1,104 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Reannounce live RMTFS/TFTP sockets without dropping their state or buffers."""
+import argparse
+import contextlib
+import ctypes
+import errno
+import os
+from pathlib import Path
+import platform
+import socket
+import struct
+import subprocess
+import sys
+
+UNITS = (('rmtfs.service', 14), ('tqftpserv.service', 4096))
+# asm-generic/unistd.h, used by the phone's aarch64 kernel (also x86_64).
+SYS_PIDFD_GETFD = 438
+QRTR_PORT_CTRL = 0xfffffffe
+
+
+def main_pid(unit):
+    value = subprocess.check_output(
+        ['systemctl', 'show', '-p', 'MainPID', '--value', unit],
+        text=True, timeout=5)
+    pid = int(value)
+    if pid <= 0:
+        raise RuntimeError(f'{unit} is not running')
+    return pid
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true',
+                        help='Check sockets and registrations without sending')
+    args = parser.parse_args()
+    if platform.machine() not in ('aarch64', 'x86_64'):
+        raise RuntimeError('pidfd_getfd syscall number not defined for this architecture')
+
+    rows = []
+    for line in subprocess.check_output(['qrtr-lookup'], text=True, timeout=5).splitlines():
+        fields = line.split()
+        if len(fields) >= 5 and all(field.isdecimal() for field in fields[:5]):
+            rows.append(tuple(map(int, fields[:5])))
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    prepared = []
+    with contextlib.ExitStack() as stack:
+        for unit, service in UNITS:
+            pid = main_pid(unit)
+            pidfd = os.pidfd_open(pid)
+            selected = []
+            try:
+                for entry in (Path('/proc') / str(pid) / 'fd').iterdir():
+                    try:
+                        if not os.readlink(entry).startswith('socket:'):
+                            continue
+                    except FileNotFoundError:
+                        continue
+                    fd = libc.syscall(SYS_PIDFD_GETFD, pidfd, int(entry.name), 0)
+                    if fd < 0:
+                        error = ctypes.get_errno()
+                        if error == errno.EBADF:
+                            continue
+                        raise OSError(error, f'pidfd_getfd for {unit}: {os.strerror(error)}')
+                    sock = socket.socket(fileno=fd)
+                    if sock.family != socket.AF_QIPCRTR:
+                        sock.close()
+                        continue
+                    node, port = sock.getsockname()
+                    matches = [row for row in rows
+                               if row[0] == service and row[3:] == (node, port)]
+                    if len(matches) != 1:
+                        sock.close()
+                        continue
+                    stack.enter_context(sock)
+                    selected.append((sock, matches[0]))
+            finally:
+                os.close(pidfd)
+            if len(selected) != 1 or main_pid(unit) != pid:
+                raise RuntimeError(f'{unit}: no unique live registered QRTR socket')
+            prepared.append((unit, pid, *selected[0]))
+
+        for unit, pid, sock, row in prepared:
+            service, version, instance, node, port = row
+            if not args.check:
+                packet = struct.pack('<IIIII', 4, service, version | (instance << 8),
+                                     node, port)
+                # No settimeout/setblocking: descriptor flags belong to the live
+                # service too. Closing this duplicate leaves its original open.
+                sent = sock.sendto(packet, socket.MSG_DONTWAIT, (node, QRTR_PORT_CTRL))
+                if sent != len(packet):
+                    raise RuntimeError(f'{unit}: incomplete QRTR announcement')
+            action = 'ready' if args.check else 'reannounced'
+            print(f'{unit}: {action}, pid={pid}, service={service}, endpoint={node}:{port}')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'veux-qrtr-reannounce: {error}', file=sys.stderr)
+        sys.exit(1)

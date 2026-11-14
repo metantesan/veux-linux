@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+
+modules=/usr/lib/veux-usbc-pd
+for module in tcpm tcpci tcpci_rt1711h; do
+	[ -e "/sys/module/$module" ] && continue
+	insmod "$modules/$module.ko"
+done
+
+for attempt in $(seq 1 20); do
+	[ -L /sys/bus/i2c/devices/2-004e/driver ] && exit 0
+	sleep 1
+done
+echo 'veux-usbc-pd: HUSB311 driver did not bind to I2C bus 2 address 0x4e' >&2
+exit 1

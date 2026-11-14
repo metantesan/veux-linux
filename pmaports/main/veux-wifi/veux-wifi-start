@@ -1,0 +1,134 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+
+fail() { echo "veux-wifi: $*" >&2; exit 1; }
+
+# Select the modem by its firmware rather than assuming remoteproc numbering.
+modem=
+for candidate in /sys/class/remoteproc/remoteproc*; do
+	[ -f "$candidate/firmware" ] || continue
+	if [ "$(cat "$candidate/firmware")" = qcom/xiaomi/veux/modem.mdt ]; then
+		modem=$candidate
+		break
+	fi
+done
+[ -n "$modem" ] || fail 'modem remoteproc is unavailable'
+
+state=$(cat "$modem/state")
+if [ "$state" = running ] && [ -d /sys/class/net/wlan0/phy80211 ]; then
+	echo 'veux-wifi: WLAN is already running'
+	exit 0
+fi
+
+# A failed boot must not enter the earlier repeated modem recovery loop.
+printf disabled > "$modem/recovery"
+case "$state" in
+	offline)
+		for service in rmtfs.service tqftpserv.service; do
+			systemctl is-active --quiet "$service" || fail "$service must be active before starting MPSS"
+		done
+		# Type=simple units can be active before their sockets are registered.
+		ready=no
+		for attempt in 1 2 3 4 5; do
+			if /usr/libexec/veux-qrtr-reannounce --check; then
+				ready=yes
+				break
+			fi
+			sleep 1
+		done
+		[ "$ready" = yes ] || fail 'RMTFS/TFTP sockets are not ready'
+		printf start > "$modem/state"
+		;;
+	running) ;;
+	*) fail "modem state is $state; refusing an automatic retry" ;;
+esac
+
+# Wait for MPSS QRTR, then announce host services over the ready transport.
+ready=no
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+	if qrtr-lookup | awk '$1 == 43 { found=1 } END { exit !found }'; then
+		ready=yes
+		break
+	fi
+	sleep 1
+done
+[ "$ready" = yes ] || fail 'MPSS QRTR transport did not become ready'
+prepare_wlan_transport() {
+	# Restarting RMTFS drops its allocation/file state during MPSS requests.
+	# Retry registration through each existing socket, preserving its process.
+	/usr/libexec/veux-qrtr-reannounce || fail 'could not reannounce RMTFS/TFTP'
+
+	mapper=/sys/bus/auxiliary/drivers/qcom_pd_mapper.qcom-pdm-mapper
+	device_path=$(readlink -f "$modem")
+	found=no
+	for candidate in "$device_path"/qcom_common.pd-mapper.*; do
+		[ -e "$candidate" ] || continue
+		device=$(basename "$candidate")
+		[ -e "$mapper/$device" ] || fail 'PD mapper is not bound'
+		printf '%s' "$device" > "$mapper/unbind"
+		printf '%s' "$device" > "$mapper/bind"
+		found=yes
+		break
+	done
+	[ "$found" = yes ] || fail 'modem PD mapper device is unavailable'
+}
+
+wait_for_wlan() {
+	limit=$1
+	for attempt in $(seq 1 "$limit"); do
+		[ -d /sys/class/net/wlan0/phy80211 ] && return 0
+		[ "$(cat "$modem/state")" = running ] || return 1
+		sleep 1
+	done
+	return 1
+}
+
+prepare_wlan_transport || fail 'could not prepare WLAN transport'
+if wait_for_wlan 30; then
+	echo 'veux-wifi: WLAN firmware ready; wlan0 registered'
+	exit 0
+fi
+
+# Some boots leave MPSS running without publishing WLFW even though RMTFS,
+# TFTP and the PD mapper are ready. A single MPSS-only retry recovered this
+# state on device. Bound it here: never let systemd create a modem restart loop.
+[ "$(cat "$modem/state")" = running ] || fail 'modem stopped during WLAN startup'
+echo 'veux-wifi: WLFW absent; retrying MPSS once'
+printf stop > "$modem/state"
+offline=no
+for attempt in $(seq 1 15); do
+	if [ "$(cat "$modem/state")" = offline ]; then
+		offline=yes
+		break
+	fi
+	sleep 1
+done
+[ "$offline" = yes ] || fail 'modem did not stop for the single WLAN retry'
+
+ready=no
+for attempt in 1 2 3 4 5; do
+	if /usr/libexec/veux-qrtr-reannounce --check; then
+		ready=yes
+		break
+	fi
+	sleep 1
+done
+[ "$ready" = yes ] || fail 'RMTFS/TFTP sockets were not ready for the WLAN retry'
+printf start > "$modem/state"
+
+ready=no
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+	if qrtr-lookup | awk '$1 == 43 { found=1 } END { exit !found }'; then
+		ready=yes
+		break
+	fi
+	sleep 1
+done
+[ "$ready" = yes ] || fail 'MPSS QRTR transport did not recover for WLAN retry'
+prepare_wlan_transport || fail 'could not prepare retried WLAN transport'
+if wait_for_wlan 45; then
+	echo 'veux-wifi: WLAN firmware ready after one MPSS retry; wlan0 registered'
+	exit 0
+fi
+fail 'WLAN interface did not appear after one MPSS retry'

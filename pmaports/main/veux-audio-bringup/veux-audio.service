@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Initialize Xiaomi veux audio DSP and speaker sound card
+Wants=rmtfs.service tqftpserv.service veux-wifi.service
+After=rmtfs.service tqftpserv.service veux-wifi.service
+ConditionPathExists=/lib/firmware/qcom/xiaomi/veux/adsp.mdt
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/veux-audio-start
+TimeoutStartSec=90
+RemainAfterExit=yes

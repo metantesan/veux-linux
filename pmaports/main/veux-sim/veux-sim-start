@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+set -eu
+
+fail() { echo "veux-sim: $*" >&2; exit 1; }
+
+primary_active() {
+	printf '%s\n' "$status" | awk "/Primary GW:/ && !/session doesn't exist/ { active=1 } END { exit !active }"
+}
+
+usim_ready() {
+	printf '%s\n' "$status" | awk '
+		/^Slot \[1\]:/ { in_slot=1; next }
+		/^Slot \[2\]:/ { in_slot=0 }
+		in_slot && /Application type:/ { is_usim=($0 ~ /usim/) }
+		in_slot && is_usim && /Application state:[[:space:]]*\047ready\047/ { ready=1 }
+		END { exit !ready }'
+}
+
+timeout 10 qmicli -d qrtr://0 --dms-set-operating-mode=online >/dev/null ||
+	fail 'could not set the modem online'
+
+status=$(timeout 10 qmicli -d qrtr://0 --uim-get-card-status) ||
+	fail 'could not query the UIM service over QRTR'
+
+# Reuse the primary USIM application and its AID instead of baking a SIM's
+# identity into the image. Only the first physical slot is populated on veux.
+if primary_active && usim_ready; then
+	echo 'veux-sim: primary USIM provisioning session is active and ready'
+	exit 0
+fi
+
+if ! primary_active; then
+	aid=$(printf '%s\n' "$status" | awk '
+		/^Slot \[1\]:/ { in_slot=1; next }
+		/^Slot \[2\]:/ { in_slot=0 }
+		in_slot && /Application type:.*usim/ { is_usim=1 }
+		in_slot && is_usim && /Application ID:/ {
+			getline
+			gsub(/[[:space:]]/, "")
+			print
+			exit
+		}')
+	[ -n "$aid" ] || fail 'no USIM application found in physical slot 1'
+
+	timeout 10 qmicli -d qrtr://0 \
+		--uim-change-provisioning-session="slot=1,activate=yes,session-type=primary-gw-provisioning,aid=$aid" \
+		>/dev/null || fail 'could not activate the primary USIM session'
+fi
+
+# Activation completes asynchronously. A session can exist before its USIM
+# reaches ready, especially immediately after MPSS boots.
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+	status=$(timeout 5 qmicli -d qrtr://0 --uim-get-card-status) || status=''
+	if primary_active && usim_ready; then
+		echo 'veux-sim: primary USIM provisioning session active and ready'
+		exit 0
+	fi
+	attempt=$((attempt + 1))
+	sleep 1
+done
+
+fail 'USIM session did not become active and ready before the timeout'

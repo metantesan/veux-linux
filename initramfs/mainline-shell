@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+cat /etc/mainline-build
+printf '\nMainline USB debug shell. Netboot runs in the background.\n'
+printf 'Read logs: cat /run/mainline-init.log; dmesg\n'
+printf 'Check network: ip address; cat /proc/partitions\n'
+printf 'Once /sysroot is mounted: mainline_continue_boot\n\n'
+exec /bin/sh -i

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Mainline bring-up. Boot images are packaged separately, never flashed by scripts.
+deviceinfo_format_version="0"
+deviceinfo_name="Xiaomi Redmi Note 11 Pro 5G (mainline development)"
+deviceinfo_manufacturer="Xiaomi"
+deviceinfo_codename="xiaomi-veux-mainline"
+deviceinfo_year="2022"
+deviceinfo_arch="aarch64"
+deviceinfo_chassis="handset"
+deviceinfo_dtb="qcom/sm6375-xiaomi-veux"
+deviceinfo_drm="false"
+deviceinfo_flash_method="fastboot"
+deviceinfo_generate_bootimg="false"
+deviceinfo_initfs_compression="gzip"
+deviceinfo_usb_network_function="ncm.usb0"

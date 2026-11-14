@@ -1,0 +1,512 @@
+Subject: [PATCH 09/11] Experimental AW8624 haptics
+
+Part of the Linux 7.3 veux development snapshot. Apply in patches/series order.
+Original source copyright and SPDX notices are retained.
+
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 169768e3d..0cd69f38c 100644
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -1023,4 +1023,14 @@ config INPUT_STPMIC1_ONKEY
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called stpmic1_onkey.
+ 
++config INPUT_AW8624_VEUX
++	tristate "Xiaomi veux AW8624 basic haptics"
++	depends on I2C && GPIOLIB
++	select REGMAP_I2C
++	select INPUT_FF_MEMLESS
++	help
++	  Basic continuous-mode FF_RUMBLE support for the AW8624 motor driver
++	  fitted to Xiaomi veux. Uses captured board tuning, capped gain and
++	  a one-second pulse limit. RAM and streamed effects are not supported.
++
+ endif
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index 1339619f0..4d5a7dcd4 100644
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -97,3 +97,4 @@ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
+ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
+ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
+ obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
++obj-$(CONFIG_INPUT_AW8624_VEUX)	+= aw8624-veux.o
+diff --git a/Documentation/devicetree/bindings/input/xiaomi,veux-aw8624.yaml b/Documentation/devicetree/bindings/input/xiaomi,veux-aw8624.yaml
+new file mode 100644
+index 000000000..6419d0688
+--- /dev/null
++++ b/Documentation/devicetree/bindings/input/xiaomi,veux-aw8624.yaml
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: GPL-2.0-only
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/input/xiaomi,veux-aw8624.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Xiaomi veux AW8624 haptic controller
++
++maintainers:
++  - hikari <me@metantesan.com>
++
++description: |
++  Board-specific basic continuous-mode support for the AW8624 on Xiaomi veux.
++  Motor tuning comes from the captured stock device tree. The initial driver
++  uses no RAM firmware or interrupt, and leaves hardware triggers disabled.
++
++properties:
++  compatible:
++    const: xiaomi,veux-aw8624
++  reg:
++    maxItems: 1
++  reset-gpios:
++    maxItems: 1
++    description: Active-low hardware reset.
++  pinctrl-names:
++    items:
++      - const: default
++  pinctrl-0: true
++
++required:
++  - compatible
++  - reg
++  - reset-gpios
++
++additionalProperties: false
+diff --git a/drivers/input/misc/aw8624-veux.c b/drivers/input/misc/aw8624-veux.c
+new file mode 100644
+index 000000000..6c1ab0b69
+--- /dev/null
++++ b/drivers/input/misc/aw8624-veux.c
+@@ -0,0 +1,432 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Basic AW8624 RAM-waveform feedback for Xiaomi veux.
++ * Register sequence derived from the AWINIC downstream aw8624 driver;
++ * motor tuning and waveform firmware from this device's captured Android.
++ * Original driver: Copyright (c) 2019 AWINIC Technology CO., LTD;
++ * author Joseph <zhangzetao@awinic.com.cn>.
++ */
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/regmap.h>
++#include <linux/workqueue.h>
++
++#define AW_ID             0x00
++#define AW_SYSINT         0x02
++#define AW_SYSCTRL        0x04
++#define AW_GO             0x05
++#define AW_STANDBY        BIT(0)
++#define AW_CONT_MODE      BIT(3)
++#define AW_DRV_LVL        0x7b
++#define AW_DRV_LVL_OV     0x7c
++#define AW_RAMDATA        0x42
++#define AW_RAM_FIRMWARE   "qcom/xiaomi/veux/aw8624_haptic.bin"
++
++struct aw8624_veux {
++	struct device *dev;
++	struct regmap *map;
++	struct gpio_desc *reset;
++	struct mutex lock;
++	struct work_struct play_work;
++	struct delayed_work stop_work;
++	u16 magnitude;
++	bool faulted;
++	bool suspended;
++	bool active;
++	bool timed_out;
++	bool ram_ready;
++};
++
++/* Stock 205 Hz motor profile. Gain is capped at 0x40 for initial bring-up. */
++static const struct reg_sequence aw8624_veux_init[] = {
++	{ AW_GO, 0 }, { AW_SYSCTRL, AW_STANDBY },
++	{ 0x03, 0xff },                 /* mask interrupts; no IRQ consumer yet */
++	{ 0x1c, 0 },                    /* disable external waveform triggers */
++	{ 0x2e, 0x40 },                 /* PWM 24 kHz */
++	{ 0x3b, 0x40 },                 /* capped digital gain */
++	{ 0x2b, 0xe0 },                 /* continuous-mode LPF */
++	{ 0x48, 0x89 },                 /* zero-cross, closed loop, auto brake */
++	{ 0x49, 0x07 }, { 0x4a, 0x54 }, /* 1e9 / (2050 * 260) = 1876 */
++	{ 0x4b, 0xf0 }, { 0x4c, 0x6c }, /* stock continuous TD */
++	{ 0x4d, 0x11 },                 /* stock TSET */
++	{ 0x72, 0x08 }, { 0x73, 0xf8 }, /* zero-cross threshold */
++	{ 0x74, 0x00 }, { 0x75, 0x08 }, /* BEMF high threshold */
++	{ 0x76, 0x03 }, { 0x77, 0xf8 }, /* BEMF low threshold */
++	{ 0x78, 0x03 }, { 0x7a, 0x23 }, /* brake count, non-zero-cross time */
++	{ 0x39, 0x2c }, { 0x4f, 0x00 }, /* stock software braking */
++	{ 0x5d, 0x80 },                 /* downstream R_SPARE enable */
++};
++
++static int aw8624_veux_load_ram(struct aw8624_veux *aw)
++{
++	const struct firmware *fw;
++	u8 verify[64];
++	u16 checksum = 0, base, first;
++	unsigned int i, count;
++	int ret, finish;
++
++	ret = request_firmware(&fw, AW_RAM_FIRMWARE, aw->dev);
++	if (ret)
++		return dev_err_probe(aw->dev, ret, "RAM waveform firmware unavailable\n");
++	if (fw->size < 49 || fw->size > 8196) {
++		ret = -EINVAL;
++		goto release;
++	}
++	for (i = 2; i < fw->size; i++)
++		checksum += fw->data[i];
++	base = (fw->data[2] << 8) | fw->data[3];
++	first = (fw->data[5] << 8) | fw->data[6];
++	if (checksum != ((fw->data[0] << 8) | fw->data[1]) ||
++	    base < 0x400 || base + fw->size - 4 > 0x2000 ||
++	    first < base + 45 || first >= base + fw->size - 4 ||
++	    (first - base - 1) % 4) {
++		ret = -EINVAL;
++		goto release;
++	}
++	ret = regmap_update_bits(aw->map, AW_SYSCTRL, BIT(5), BIT(5));
++	if (ret)
++		goto release;
++	/* Stock RAM/FIFO allocation and waveform pointer. */
++	for (i = 0; i < 4; i++) {
++		u16 value = i == 0 ? base : i == 1 ? base / 2 :
++			    i == 2 ? base - base / 4 : base;
++		unsigned int reg = i == 3 ? 0x40 : 0x21 + i * 2;
++
++		ret = regmap_write(aw->map, reg, value >> 8);
++		if (ret)
++			goto disable;
++		ret = regmap_write(aw->map, reg + 1, value & 0xff);
++		if (ret)
++			goto disable;
++	}
++	ret = regmap_noinc_write(aw->map, AW_RAMDATA, fw->data + 4, fw->size - 4);
++	if (ret)
++		goto disable;
++	ret = regmap_write(aw->map, 0x40, base >> 8);
++	if (ret)
++		goto disable;
++	ret = regmap_write(aw->map, 0x41, base & 0xff);
++	if (ret)
++		goto disable;
++	for (i = 4; i < fw->size; i += count) {
++		count = min_t(unsigned int, sizeof(verify), fw->size - i);
++		ret = regmap_noinc_read(aw->map, AW_RAMDATA, verify, count);
++		if (ret)
++			goto disable;
++		if (memcmp(verify, fw->data + i, count)) {
++			ret = -EIO;
++			goto disable;
++		}
++	}
++disable:
++	finish = regmap_update_bits(aw->map, AW_SYSCTRL, BIT(5), 0);
++	if (!ret)
++		ret = finish;
++	if (!ret)
++		dev_info(aw->dev, "stock RAM waveforms loaded and read-back verified (%zu bytes)\n",
++			 fw->size);
++release:
++	release_firmware(fw);
++	return ret;
++}
++
++static int aw8624_veux_stop(struct aw8624_veux *aw)
++{
++	int ret, standby;
++
++	aw->active = false;
++	ret = regmap_write(aw->map, AW_GO, 0);
++	/* Always attempt standby, including after an unsuccessful GO write. */
++	standby = regmap_update_bits(aw->map, AW_SYSCTRL,
++				     AW_STANDBY, AW_STANDBY);
++	return ret ? ret : standby;
++}
++
++static void aw8624_veux_fault(struct aw8624_veux *aw, int error)
++{
++	aw8624_veux_stop(aw);
++	gpiod_set_value_cansleep(aw->reset, 1);
++	aw->faulted = true;
++	dev_err(aw->dev, "haptic I/O failed (%d), holding chip in reset\n", error);
++}
++
++static void aw8624_veux_timeout(struct work_struct *work)
++{
++	struct aw8624_veux *aw = container_of(to_delayed_work(work),
++					struct aw8624_veux, stop_work);
++	int ret;
++
++	mutex_lock(&aw->lock);
++	WRITE_ONCE(aw->magnitude, 0);
++	aw->timed_out = true;
++	if (!aw->faulted) {
++		ret = aw8624_veux_stop(aw);
++		if (ret)
++			aw8624_veux_fault(aw, ret);
++	}
++	mutex_unlock(&aw->lock);
++}
++
++static void aw8624_veux_play_work(struct work_struct *work)
++{
++	struct aw8624_veux *aw = container_of(work, struct aw8624_veux, play_work);
++	u16 magnitude;
++	unsigned int status;
++	int ret;
++
++	mutex_lock(&aw->lock);
++	if (aw->faulted || aw->suspended)
++		goto out;
++	magnitude = READ_ONCE(aw->magnitude);
++	if (!magnitude) {
++		aw->timed_out = false;
++		cancel_delayed_work(&aw->stop_work);
++		ret = aw8624_veux_stop(aw);
++		goto check;
++	}
++	if (aw->timed_out)
++		goto out;
++	/* Stock FF_CONSTANT uses looped waveform 11; cap its gain at 0x40. */
++	ret = regmap_write(aw->map, 0x3b, 0x1e + (0x40 - 0x1e) * magnitude / 0xffff);
++	if (ret)
++		goto check;
++	ret = regmap_write(aw->map, 0x07, 11);
++	if (ret)
++		goto check;
++	ret = regmap_write(aw->map, 0x08, 0);
++	if (ret)
++		goto check;
++	ret = regmap_write(aw->map, 0x0f, 0xf0);
++	if (ret)
++		goto check;
++	ret = regmap_update_bits(aw->map, AW_SYSCTRL,
++				 GENMASK(3, 2) | AW_STANDBY, 0);
++	if (ret)
++		goto check;
++	ret = regmap_read(aw->map, AW_SYSINT, &status);
++	if (ret)
++		goto check;
++	ret = regmap_write(aw->map, AW_GO, 1);
++	if (!ret && !aw->active) {
++		/* Independent upper bound in addition to FF's effect stop timer. */
++		mod_delayed_work(system_wq, &aw->stop_work, msecs_to_jiffies(1000));
++		aw->active = true;
++	}
++check:
++	if (ret)
++		aw8624_veux_fault(aw, ret);
++out:
++	mutex_unlock(&aw->lock);
++}
++
++static int aw8624_veux_play(struct input_dev *input, void *unused,
++			    struct ff_effect *effect)
++{
++	struct aw8624_veux *aw = input_get_drvdata(input);
++
++	if (READ_ONCE(aw->suspended))
++		return 0;
++	WRITE_ONCE(aw->magnitude, max(effect->u.rumble.strong_magnitude,
++				    effect->u.rumble.weak_magnitude));
++	schedule_work(&aw->play_work);
++	return 0;
++}
++
++static void aw8624_veux_quiesce(struct aw8624_veux *aw)
++{
++	int ret;
++
++	WRITE_ONCE(aw->magnitude, 0);
++	cancel_work_sync(&aw->play_work);
++	cancel_delayed_work_sync(&aw->stop_work);
++	mutex_lock(&aw->lock);
++	aw->timed_out = false;
++	if (!aw->faulted) {
++		ret = aw8624_veux_stop(aw);
++		if (ret)
++			aw8624_veux_fault(aw, ret);
++	}
++	mutex_unlock(&aw->lock);
++}
++
++static void aw8624_veux_close(struct input_dev *input)
++{
++	aw8624_veux_quiesce(input_get_drvdata(input));
++}
++
++static int aw8624_veux_open(struct input_dev *input)
++{
++	struct aw8624_veux *aw = input_get_drvdata(input);
++	int ret = 0;
++
++	/* Opening happens after switch_root. Keep firmware I/O outside FF's
++	 * effect timer and avoid requesting SD-root files during built-in probe.
++	 */
++	mutex_lock(&aw->lock);
++	if (aw->faulted)
++		ret = -EIO;
++	else if (!aw->ram_ready) {
++		ret = aw8624_veux_load_ram(aw);
++		if (!ret)
++			aw->ram_ready = true;
++	}
++	mutex_unlock(&aw->lock);
++	return ret;
++}
++
++static void aw8624_veux_cleanup(void *data)
++{
++	struct aw8624_veux *aw = data;
++
++	WRITE_ONCE(aw->suspended, true);
++	aw8624_veux_quiesce(aw);
++	gpiod_set_value_cansleep(aw->reset, 1);
++}
++
++static bool aw8624_veux_ram_port(struct device *dev, unsigned int reg)
++{
++	return reg == AW_RAMDATA;
++}
++
++static const struct regmap_config aw8624_veux_regmap = {
++	.reg_bits = 8,
++	.val_bits = 8,
++	.max_register = 0x7f,
++	.max_raw_read = 128,
++	.max_raw_write = 128,
++	.volatile_reg = aw8624_veux_ram_port,
++	.writeable_noinc_reg = aw8624_veux_ram_port,
++	.readable_noinc_reg = aw8624_veux_ram_port,
++};
++
++static int aw8624_veux_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct aw8624_veux *aw;
++	struct input_dev *input;
++	unsigned int id;
++	int ret, attempt;
++
++	aw = devm_kzalloc(dev, sizeof(*aw), GFP_KERNEL);
++	if (!aw)
++		return -ENOMEM;
++	aw->dev = dev;
++	/* Failure cleanup must not program a device whose ID is still unknown. */
++	aw->faulted = true;
++	mutex_init(&aw->lock);
++	INIT_WORK(&aw->play_work, aw8624_veux_play_work);
++	INIT_DELAYED_WORK(&aw->stop_work, aw8624_veux_timeout);
++	aw->map = devm_regmap_init_i2c(client, &aw8624_veux_regmap);
++	if (IS_ERR(aw->map))
++		return dev_err_probe(dev, PTR_ERR(aw->map), "regmap unavailable\n");
++	aw->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(aw->reset))
++		return dev_err_probe(dev, PTR_ERR(aw->reset), "reset GPIO unavailable\n");
++	ret = devm_add_action_or_reset(dev, aw8624_veux_cleanup, aw);
++	if (ret)
++		return ret;
++	msleep(5);
++	gpiod_set_value_cansleep(aw->reset, 0);
++	msleep(5);
++	for (attempt = 0; attempt < 3; attempt++) {
++		ret = regmap_read(aw->map, AW_ID, &id);
++		if (!ret && id == 0x24)
++			break;
++		msleep(5);
++	}
++	if (ret)
++		return dev_err_probe(dev, ret, "chip ID read failed\n");
++	if (id != 0x24)
++		return dev_err_probe(dev, -ENODEV, "unexpected chip ID %#x\n", id);
++	ret = regmap_write(aw->map, AW_ID, 0xaa);
++	if (ret)
++		return ret;
++	usleep_range(1000, 2000);
++	ret = regmap_multi_reg_write(aw->map, aw8624_veux_init,
++				     ARRAY_SIZE(aw8624_veux_init));
++	if (ret)
++		return dev_err_probe(dev, ret, "motor setup failed\n");
++	ret = regmap_update_bits(aw->map, 0x66, BIT(6), BIT(6));
++	if (ret)
++		return ret;
++	/* Match downstream's motor-protection setup and calibrated OSC source.
++	 * Electrical over-current/temperature protection is separate.
++	 */
++	ret = regmap_update_bits(aw->map, 0x5f, BIT(5), BIT(5));
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(aw->map, 0x2d, BIT(7), 0);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(aw->map, 0x3e, BIT(7), 0);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(aw->map, 0x38, BIT(5), BIT(5));
++	if (ret)
++		return ret;
++	aw->faulted = false;
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++	input->name = "AW8624 haptics";
++	input->id.bustype = BUS_I2C;
++	input->open = aw8624_veux_open;
++	input->close = aw8624_veux_close;
++	input_set_drvdata(input, aw);
++	input_set_capability(input, EV_FF, FF_RUMBLE);
++	/* FF memless owns its data pointer; state here is managed separately. */
++	ret = input_ff_create_memless(input, NULL, aw8624_veux_play);
++	if (ret)
++		return ret;
++	i2c_set_clientdata(client, aw);
++	ret = input_register_device(input);
++	if (ret)
++		return ret;
++	dev_info(dev, "AW8624 ID %#x: 205 Hz FF_RUMBLE ready, output idle\n", id);
++	return 0;
++}
++
++static int aw8624_veux_suspend(struct device *dev)
++{
++	struct aw8624_veux *aw = dev_get_drvdata(dev);
++
++	WRITE_ONCE(aw->suspended, true);
++	aw8624_veux_quiesce(aw);
++	return 0;
++}
++
++static int aw8624_veux_resume(struct device *dev)
++{
++	struct aw8624_veux *aw = dev_get_drvdata(dev);
++
++	WRITE_ONCE(aw->suspended, false);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(aw8624_veux_pm, aw8624_veux_suspend,
++			      aw8624_veux_resume);
++
++static const struct of_device_id aw8624_veux_of_match[] = {
++	{ .compatible = "xiaomi,veux-aw8624" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, aw8624_veux_of_match);
++
++static struct i2c_driver aw8624_veux_driver = {
++	.probe = aw8624_veux_probe,
++	.driver = {
++		.name = "aw8624-veux",
++		.of_match_table = aw8624_veux_of_match,
++		.pm = pm_sleep_ptr(&aw8624_veux_pm),
++	},
++};
++module_i2c_driver(aw8624_veux_driver);
++
++MODULE_DESCRIPTION("Xiaomi veux AW8624 stock RAM-waveform haptics");
++MODULE_LICENSE("GPL");
++MODULE_FIRMWARE(AW_RAM_FIRMWARE);

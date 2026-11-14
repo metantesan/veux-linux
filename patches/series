@@ -1,0 +1,11 @@
+0001-boot-pinctrl.patch
+0002-shared-interconnect.patch
+0003-display.patch
+0004-touch.patch
+0005-gpu.patch
+0006-power.patch
+0007-wireless-modem.patch
+0008-audio.patch
+0009-haptics.patch
+0010-camera-experimental.patch
+0011-board-config.patch
