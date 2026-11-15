@@ -23,7 +23,7 @@ done < "$patch_dir/series"
 | 0006 | SYV690 charging |
 | 0007 | Modem remoteproc, service domains and IPA |
 | 0008 | Audio codecs, SoundWire and Q6AFE |
-| 0009 | Experimental haptics |
+| 0009 | AW8624 continuous FF_RUMBLE haptics |
 | 0010 | Experimental camera controller and sensor ID probe |
 | 0011 | Shared SoC definitions, board DTS and kernel configuration |
 
@@ -36,15 +36,14 @@ Camera capture does not work: the sensor identity read times out. The camera
 patch retains failed diagnostic experiments, including GPIO-high precharge;
 that experiment was based on an incorrect interpretation of downstream GPIO
 flags and must not be treated as a verified Android initialization sequence.
-Haptics registered an input device but produced no felt vibration.
+The AW8624 continuous FF_RUMBLE path now produces vibration on the
+development device. Probe configures 24 kHz PWM while preserving and
+checking the PWM output-enable bit; the previous full-register write had
+cleared that bit. Each pulse is limited to one second. RAM and streamed
+waveforms are not supported.
 
-The split was checked by applying both the original combined patch and this
-ordered series to private Git indexes of the same pristine kernel base. Both
-produced tree `d9b74afa3cb6198f95c680b5307693ad34fb0028`. This confirms source
-equivalence; it is not a new kernel build or hardware test.
-
-The subsequent license review restored a truncated Goodix author email address
-in patch 0004 and selected GPL-2.0-only for the owner's original board DTS and
-binding schemas. These attribution/license-only corrections change the source
-tree hash from the initial split result above; executable driver behavior is
-unchanged. Imported licenses and author notices are retained.
+The complete ordered series applies cleanly to the pinned Linux 7.3 base.
+The resulting source tree is `65d2738cbdfa562486fcd62db56154bc632f4784`.
+This confirms patch applicability, not a kernel build. The AW8624 driver was
+built and verified on the development phone: a maximum-strength, one-second
+continuous pulse produced vibration.

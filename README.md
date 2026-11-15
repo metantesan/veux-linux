@@ -39,7 +39,7 @@ mean every feature is enabled by a fresh minimal installation.
 | Power / volume buttons | Partial | Volume input events verified; full wake/suspend behavior pending |
 | CPU frequency / temperature | Partial | Source support present; complete thermal/throttling validation pending |
 | Cameras | Not working | Main sensor ID read times out; no capture |
-| Haptics | Not working | Driver probes, but test pulses were not felt |
+| Haptics | Working | Continuous FF_RUMBLE confirmed on device; one-second cap; no RAM/streamed effects |
 | Bluetooth / GNSS | Unverified | No complete pairing or location test |
 | Motion / light / proximity sensors | Unverified | Drivers and userspace integration pending |
 | Fingerprint / NFC / IR | Unverified | Fitted hardware and control paths need confirmation |
@@ -56,7 +56,7 @@ mean every feature is enabled by a fresh minimal installation.
   bin for this unit has not been confirmed. Dynamic scaling needs the correct
   bin, voltage and bandwidth handling plus stability testing. An 800 MHz maximum
   is not established by this evidence.
-- Camera capture and haptic vibration do not work.
+- Camera capture does not work.
 - Call audio, microphone capture, earpiece routing and full fast charging are
   unfinished. Cellular data is not verified end to end.
 - Only one SIM has been tested. The second SIM position shares the microSD
