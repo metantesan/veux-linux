@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Tag before 73-seat-late.rules assigns the active-session ACL.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT}=="1", SUBSYSTEMS=="input", ATTRS{name}=="AW8624 haptics", TAG+="uaccess", ENV{FEEDBACKD_TYPE}="vibra"

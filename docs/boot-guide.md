@@ -107,6 +107,22 @@ mandatory radio, firmware, audio and USB-PD packages and their startup hooks.
 It requires only the kernel, base OS, OpenSSH, agetty, unudhcpd and kmod.
 The full templates under `pmaports/` are preserved for later integration.
 
+To include USB-PD and/or AW8624 feedback support in this staged image, repeat
+`--extra-package` for each package:
+
+```sh
+python3 tools/stage-minimal-rootfs.py --aports work/pmaports --build work/build \
+    --extra-package veux-usbc-pd \
+    --extra-package veux-aw8624-feedbackd
+```
+
+The USB-PD option packages `tcpm`, `tcpci` and `tcpci_rt1711h` from that kernel
+build and rejects modules with a mismatched release. The haptics option adds
+the AW8624 udev rule and places the development account named `user` in the
+`input` group. If you selected a different account, add it to `input` after
+installation from that account's shell with `sudo addgroup "$USER" input`.
+Plasma/feedbackd itself is still a separate desktop dependency.
+
 Define this shell function in the same terminal:
 
 ```sh
@@ -318,14 +334,19 @@ this minimal recipe.
   RMTFS/TFTP, NetworkManager/ModemManager and their service configuration.
 - Audio needs modules built for the running kernel, amplifier firmware,
   routing/UCM and DSP setup. The full audio APKBUILD refers to external inputs.
-- USB-PD uses separately packaged TCPM/TCPCI modules. The minimal profile does
-  not promise charging behavior identical to the configured development image.
+- USB-PD uses separately packaged TCPM/TCPCI modules. The package enables the
+  controller and standard negotiation; 67 W HyperCharge is not implemented.
+- AW8624 haptics use the `veux-aw8624-feedbackd` udev package so feedbackd can
+  recognize the vibrator and the active user session can access it. Install the
+  desktop's feedbackd service separately; the haptics package does not install
+  Plasma.
 
-The package sources are included, but source recipes with missing generated
-inputs and empty `sha512sums` are not ready for direct `pmbootstrap build`.
-Do not add every full-profile package to `extra_packages` and expect it to
-build. Full desktop/radio/audio provisioning needs additional public staging
-and firmware-extraction tooling; that part of the installation is unfinished.
+The minimal staging command prepares checksummed sources for its kernel/device
+packages. Optional USB-PD and haptics packages can be staged with the flags
+above. Other full-profile packages may have generated firmware or module inputs
+that this tool does not prepare; do not add them to `extra_packages` until
+those inputs are available. Full desktop/radio/audio provisioning remains
+unfinished.
 
 ## 9. Troubleshooting and rollback
 

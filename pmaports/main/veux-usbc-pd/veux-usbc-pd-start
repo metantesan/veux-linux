@@ -9,8 +9,11 @@ for module in tcpm tcpci tcpci_rt1711h; do
 done
 
 for attempt in $(seq 1 20); do
-	[ -L /sys/bus/i2c/devices/2-004e/driver ] && exit 0
+	for device in /sys/bus/i2c/devices/*-004e; do
+		[ -L "$device/driver" ] || continue
+		[ "$(basename "$(readlink -f "$device/driver")")" = rt1711h ] && exit 0
+	done
 	sleep 1
 done
-echo 'veux-usbc-pd: HUSB311 driver did not bind to I2C bus 2 address 0x4e' >&2
+echo 'veux-usbc-pd: HUSB311-compatible controller at I2C address 0x4e did not bind to rt1711h' >&2
 exit 1

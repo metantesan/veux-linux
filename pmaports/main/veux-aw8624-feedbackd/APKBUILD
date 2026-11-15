@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+maintainer="hikari <me@metantesan.com>"
+pkgname=veux-aw8624-feedbackd
+pkgver=1
+pkgrel=2
+pkgdesc="Expose Xiaomi veux AW8624 haptics to feedbackd and the active desktop session"
+url="https://postmarketos.org"
+arch="aarch64"
+license="GPL-2.0-only"
+depends="feedbackd-udev"
+source="72-veux-aw8624-feedbackd.rules"
+options="!check !archcheck"
+
+_add_input_group() {
+	# Some rootfs installers add their configured user after installing packages.
+	id user >/dev/null 2>&1 || return 0
+	if ! id -nG user 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+		addgroup user input
+	fi
+}
+
+post_install() {
+	_add_input_group
+}
+
+post_upgrade() {
+	_add_input_group
+}
+
+package() {
+	install -Dm644 "$srcdir/72-veux-aw8624-feedbackd.rules" \
+		"$pkgdir/usr/lib/udev/rules.d/72-veux-aw8624-feedbackd.rules"
+}
+
+# Filled in the staged copy by stage-minimal-rootfs.py.
+sha512sums=""
