@@ -1,0 +1,85 @@
+Subject: [PATCH 12/13] power: supply: syv690: follow the fixed USB-PD contract
+
+Follow the negotiated fixed-PD contract dynamically, capped at 2 A. Retain
+the 500 mA fallback and existing battery safety checks; leave charge voltage,
+charge current, and the charge-enable bit unchanged.
+
+Part of the Linux 7.3 veux development series.
+
+diff --git a/drivers/power/supply/syv690_charger.c b/drivers/power/supply/syv690_charger.c
+--- a/drivers/power/supply/syv690_charger.c
++++ b/drivers/power/supply/syv690_charger.c
+@@ -25,8 +25,8 @@
+ #define SYV690_SAFE_IINLIM_UA	500000
+ #define SYV690_PD_IINLIM_UA	2000000
+ #define SYV690_PD_MIN_VOLTAGE_UV	4500000
+-#define SYV690_PD_MAX_VOLTAGE_UV	5500000
+-#define SYV690_TCPM_PSY_NAME	"tcpm-source-psy-2-004e"
++#define SYV690_PD_MAX_VOLTAGE_UV	10000000
++#define SYV690_TCPM_PSY_NAME	"tcpm-source-psy-4-004e"
+ 
+ struct syv690_limit {
+ 	unsigned int reg;
+@@ -153,10 +153,9 @@
+ }
+ 
+ /*
+- * Xiaomi's downstream driver sets a 2 A input limit for DCP/MaxCharge. In
+- * mainline, use that limit only while TCPM confirms our fixed 5 V/2 A PD
+- * contract. Otherwise restore the inherited-safe 500 mA limit. Do not change
+- * charge-current, charge-voltage, or charge-enable fields here.
++ * Follow the negotiated fixed-PD contract dynamically, capped at 2 A and
++ * 10 V. The 9 V ceiling remains below the downstream charge-pump bus OVP.
++ * Do not change charge-current, charge-voltage, or charge-enable fields here.
+  */
+ static int syv690_sync_pd_input_limit(struct syv690 *chip)
+ {
+@@ -186,7 +185,7 @@
+ 		if (!ret && online.intval && usb_type.intval == POWER_SUPPLY_USB_TYPE_PD &&
+ 		    voltage.intval >= SYV690_PD_MIN_VOLTAGE_UV &&
+ 		    voltage.intval <= SYV690_PD_MAX_VOLTAGE_UV &&
+-		    current_max.intval >= SYV690_PD_IINLIM_UA &&
++		    current_max.intval > 0 &&
+ 		    !power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_PRESENT,
+ 					       &present) &&
+ 		    !power_supply_get_property(chip->battery, POWER_SUPPLY_PROP_TEMP,
+@@ -197,7 +196,8 @@
+ 					 battery_voltage.intval, chip->fault,
+ 					 chip->status & SYV690_POWER_GOOD,
+ 					 chip->inhibit || chip->suspended))
+-			target = SYV690_PD_IINLIM_UA;
++			target = min_t(unsigned int, SYV690_PD_IINLIM_UA,
++				      current_max.intval);
+ 
+ 		power_supply_put(tcpm);
+ 	}
+@@ -621,7 +621,7 @@
+ 	if (IS_ENABLED(CONFIG_CHARGER_SYV690_CONTROL))
+ 		dev_info(dev, "SYV690 rev0: input500mA charge512mA voltage4192mV; gauge policy10-40C\n");
+ 	else if (IS_ENABLED(CONFIG_CHARGER_SYV690_PD_LIMIT))
+-		dev_info(dev, "SYV690 rev0: 500 mA fallback; 2 A only on valid 5 V/2 A PD\n");
++		dev_info(dev, "SYV690 rev0: 500 mA fallback; contract-tracked fixed PD up to 9 V/2 A\n");
+ 	else if (IS_ENABLED(CONFIG_CHARGER_SYV690_SWITCH))
+ 		dev_info(dev, "SYV690 rev0: manual switch only; no automatic charger writes\n");
+ 	else
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -1231,12 +1231,12 @@
+ 	  charging profile, a healthy gauge and unchanged conservative limits.
+ 
+ config CHARGER_SYV690_PD_LIMIT
+-	bool "Bound SYV690 input current to the fixed USB-PD contract"
++	bool "Dynamically track SYV690 input limit to USB-PD contract"
+ 	depends on CHARGER_SYV690 && !CHARGER_SYV690_CONTROL && CHARGER_SYV690_SWITCH
+ 	help
+ 	  Allow the board driver to update only the SYV690 input-current field.
+-	  Select 2 A only while TCPM reports an online 5 V PD contract with at
+-	  least 2 A available and the battery/source checks pass; otherwise restore
+-	  500 mA. Charge current, voltage and charge enable are left unchanged.
++	  Follow fixed-PD contracts up to 10 V, capped at 2 A, subject to battery
++	  safety checks. Restore the inherited 500 mA fallback otherwise. Charge
++	  current, voltage and charge enable are left unchanged.
+ 
+ endif # POWER_SUPPLY

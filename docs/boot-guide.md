@@ -332,10 +332,15 @@ this minimal recipe.
   adapt that to your chosen account. It relies on an existing desktop setup.
 - Wi-Fi/modem need matching device firmware, ath10k assets, QRTR,
   RMTFS/TFTP, NetworkManager/ModemManager and their service configuration.
-- Audio needs modules built for the running kernel, amplifier firmware,
-  routing/UCM and DSP setup. The full audio APKBUILD refers to external inputs.
-- USB-PD uses separately packaged TCPM/TCPCI modules. The package enables the
-  controller and standard negotiation; 67 W HyperCharge is not implemented.
+- Stereo speaker playback uses the AW88261 route in the board DTS and the
+  `veux-audio-bringup` R3 package. The package checks the kernel-notes
+  fingerprint before loading its external module bundle. The module archive,
+  reset helper and proprietary amplifier ACF firmware are separate inputs;
+  microphone, earpiece and call routing remain unverified.
+- USB-PD uses separately packaged TCPM/TCPCI modules. The board advertises
+  fixed 5 V/2 A and 9 V/2 A profiles, and the SYV690 input limit follows the
+  negotiated contract up to 2 A. A 9 V/2 A contract was observed on-device.
+  Xiaomi 67 W HyperCharge is not implemented.
 - AW8624 haptics use the `veux-aw8624-feedbackd` udev package so feedbackd can
   recognize the vibrator and the active user session can access it. Install the
   desktop's feedbackd service separately; the haptics package does not install

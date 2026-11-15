@@ -28,15 +28,15 @@ mean every feature is enabled by a fresh minimal installation.
 | microSD | Working | Root filesystem boots from partition 2 |
 | Internal UFS | Partial | Not an installation target; reliable access unverified |
 | Battery | Working | Capacity, voltage, current, temperature and UPower telemetry |
-| Charging | Partial | Standard charging observed; 67 W HyperCharge unsupported |
+| Charging | Partial | Standard fixed USB-PD reached 9 V/2 A (18 W contract); Xiaomi 67 W HyperCharge unsupported |
 | Wi-Fi | Working | Association and internet observed; startup/recovery needs wider testing |
 | Modem / SIM | Working with one SIM | Second SIM untested: its position shares the microSD slot used by the rootfs |
 | Calls | Working signalling | User confirms calls work; call audio integration remains unfinished |
 | SMS | Working | User confirmed; tested with one SIM |
 | Cellular data | Unverified | End-to-end data connection not confirmed |
-| Speaker output | Working | User confirmed playback; broader routing testing pending |
+| Speaker output | Working | Stereo AW88261 speaker playback confirmed; earpiece and call routes unverified |
 | Earpiece / microphones | Unfinished | Capture and call routing not verified |
-| Power / volume buttons | Partial | Volume input events verified; full wake/suspend behavior pending |
+| Power / volume buttons | Regression reported | Volume buttons currently unresponsive on the latest build; older event captures do not verify this kernel |
 | CPU frequency / temperature | Partial | Source support present; complete thermal/throttling validation pending |
 | Cameras | Not working | Main sensor ID read times out; no capture |
 | Haptics | Working | Continuous FF_RUMBLE confirmed on device; one-second cap; no RAM/streamed effects |
@@ -57,6 +57,9 @@ mean every feature is enabled by a fresh minimal installation.
   bin, voltage and bandwidth handling plus stability testing. An 800 MHz maximum
   is not established by this evidence.
 - Camera capture does not work.
+- The volume buttons are reported unresponsive on the latest build. An older
+  `evtest` capture showed correct key events, but the current input path has not
+  been rechecked.
 - Call audio, microphone capture, earpiece routing and full fast charging are
   unfinished. Cellular data is not verified end to end.
 - Only one SIM has been tested. The second SIM position shares the microSD

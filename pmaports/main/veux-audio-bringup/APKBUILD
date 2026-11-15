@@ -2,7 +2,7 @@
 maintainer="hikari <me@metantesan.com>"
 pkgname=veux-audio-bringup
 pkgver=1
-pkgrel=1
+pkgrel=3
 pkgdesc="Xiaomi veux audio DSP, speaker playback, and PulseAudio UCM profile"
 url="https://postmarketos.org"
 arch="aarch64"

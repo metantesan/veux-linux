@@ -26,11 +26,14 @@ done < "$patch_dir/series"
 | 0009 | AW8624 continuous FF_RUMBLE haptics |
 | 0010 | Experimental camera controller and sensor ID probe |
 | 0011 | Shared SoC definitions, board DTS and kernel configuration |
+| 0012 | SYV690 input-current limit follows the fixed-PD contract, capped at 2 A |
+| 0013 | USB-PD sink advertises fixed 5 V/2 A and 9 V/2 A profiles |
 
 The series preserves the development source snapshot. Shared DRM code is in
 0003; shared interconnect code is in 0002. The board integration patch contains
 device nodes for several subsystems, so these are review boundaries rather than
-independently selectable feature switches. Apply the complete series.
+independently selectable feature switches. Patches 0012 and 0013 extend the
+existing charger and board definitions. Apply the complete series.
 
 Camera capture does not work: the sensor identity read times out. The camera
 patch retains failed diagnostic experiments, including GPIO-high precharge;
@@ -42,8 +45,10 @@ checking the PWM output-enable bit; the previous full-register write had
 cleared that bit. Each pulse is limited to one second. RAM and streamed
 waveforms are not supported.
 
-The complete ordered series applies cleanly to the pinned Linux 7.3 base.
-The resulting source tree is `65d2738cbdfa562486fcd62db56154bc632f4784`.
-This confirms patch applicability, not a kernel build. The AW8624 driver was
+Patches 0001-0011 were previously checked against the pinned Linux 7.3 base;
+that result had source-tree hash `65d2738cbdfa562486fcd62db56154bc632f4784`.
+The follow-up patches 0012-0013 apply to the matching post-0011 charger and
+board source files. The full updated source-tree hash has not been recalculated,
+and patch application does not establish a kernel build. The AW8624 driver was
 built and verified on the development phone: a maximum-strength, one-second
 continuous pulse produced vibration.

@@ -9,3 +9,5 @@
 0009-haptics.patch
 0010-camera-experimental.patch
 0011-board-config.patch
+0012-syv690-pd-contract-limit.patch
+0013-usb-pd-9v-sink-profile.patch

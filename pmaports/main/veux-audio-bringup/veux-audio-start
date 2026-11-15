@@ -4,7 +4,7 @@
 set -eu
 fail() { echo "veux-audio: $*" >&2; exit 1; }
 
-expected=136ffed60134c277c93bf70fc80719d95822945a22a11cd556d5f940e973df77
+expected=a53004c5bb5626b1b355232ee1d91619d68a9157279266096640e9b012ca0950
 [ "$(sha256sum /sys/kernel/notes | cut -d ' ' -f 1)" = "$expected" ] ||
 	fail 'kernel build differs from the bundled audio modules'
 
